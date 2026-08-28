@@ -1,0 +1,12 @@
+{
+  "review": {
+    "header": "阶段切换",
+    "fullQuestion": "批准切换到「{stage}」阶段并归档当前会话？",
+    "lightQuestion": "批准切换到「{stage}」阶段？",
+    "approveLabel": "批准",
+    "keepStageLabel": "保持当前阶段",
+    "fullApproveDescription": "切换阶段；当前会话被归档，交接文档接管后续工作。",
+    "lightApproveDescription": "切换到下一阶段；会话保持原样。",
+    "keepStageDescription": "留在当前阶段；反馈返回给模型。"
+  }
+}
