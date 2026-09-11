@@ -83,6 +83,12 @@ export class MemoryFs extends FileSystem {
     return new Uint8Array()
   }
 
+  async readByteRange(target: FsTarget, range: { offset: number; length: number }): Promise<Uint8Array> {
+    const content = this.files.get(target.displayPath)
+    if (content === undefined) throw new Error(`no such file: ${target.displayPath}`)
+    return new TextEncoder().encode(content).subarray(range.offset, range.offset + range.length)
+  }
+
   async listDir(): Promise<[]> {
     return []
   }
@@ -167,7 +173,7 @@ export function promptTexts(agent: Agent & { session: Session }): string[] {
 
 /** The `summary` of every durable stage-switch notice, in append order. */
 export function stageNoticeSummaries(session: Session): string[] {
-  return session.events
+  return session.snapshotEvents()
     .filter(event => event.type === 'user/message')
     .map(event => event.data as UserMessage)
     .filter(message => message.source.kind === 'plugin' && message.source.plugin === 'stage-switch')

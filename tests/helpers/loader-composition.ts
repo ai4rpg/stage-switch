@@ -2,7 +2,7 @@
 // (tests/loader-composition.spec.ts). The composition boots a test-only
 // cordis.yml through @deepseek-ai/cordis-plugin-loader + cordis-plugin-include;
 // what stands in for the outside world: the filesystem backend (MemoryFs) and
-// the review answers (a mock user-questions provider — a human is the
+// the review answers (a user-questions answerer listener — a human is the
 // nondeterministic input); everything else is the real shipping plugin.
 //
 // Tier-specific pieces stay here: makeAgent registers a real agent on the

@@ -5,11 +5,12 @@
 // model-visible request/log, durable state, or user-visible output.
 //
 // What is real here: the Loader/Include pair parses and mounts every entry of
-// the cordis.yml; session, system-prompt, tools, agent registry, user
-// questions, commands, and token-meter are the shipping plugins; stage-switch
-// loads exactly as a deployment loads it. What stands in for the outside
-// world: the filesystem backend (MemoryFs) and the review answers (a mock
-// user-questions provider — a human is the nondeterministic input).
+// the cordis.yml; session, session-projection, system-prompt, tools, agent
+// registry, user questions, commands, and token-meter are the shipping
+// plugins; stage-switch loads exactly as a deployment loads it. What stands
+// in for the outside world: the filesystem backend (MemoryFs) and the review
+// answers (a user-questions answerer listener — a human is the
+// nondeterministic input).
 //
 // The specifier→module resolution is pinned to already-imported source
 // modules via `loader.internal.import` (the testing policy's source plane:
@@ -28,8 +29,9 @@ import '@deepseek-ai/cordis-plugin-loader'
 import '@deepseek-ai/cordis-plugin-include'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SessionStore, { Session } from '@deepseek-ai/dsh-session'
+import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -62,6 +64,7 @@ async function loadComposition(): Promise<{ ctx: Context; agent: Agent & { sessi
   await writeFile(configPath, [
     "- name: 'test:memory-fs'",
     "- name: '@deepseek-ai/dsh-session'",
+    "- name: '@deepseek-ai/dsh-session-projection'",
     "- name: '@deepseek-ai/dsh-system-prompt'",
     "- name: '@deepseek-ai/dsh-token-meter'",
     "- name: '@deepseek-ai/dsh-tools'",
@@ -84,6 +87,7 @@ async function loadComposition(): Promise<{ ctx: Context; agent: Agent & { sessi
   const modules = new Map<string, unknown>([
     ['test:memory-fs', MemoryFs],
     ['@deepseek-ai/dsh-session', SessionStore],
+    ['@deepseek-ai/dsh-session-projection', SessionProjection],
     ['@deepseek-ai/dsh-system-prompt', SystemPrompt],
     ['@deepseek-ai/dsh-token-meter', TokenMeter],
     ['@deepseek-ai/dsh-tools', ToolRuntime],
@@ -115,7 +119,7 @@ async function loadComposition(): Promise<{ ctx: Context; agent: Agent & { sessi
 let callCounter = 0
 function callStage(ctx: Context, name: string, agent: Agent, args: Record<string, unknown>) {
   return ctx.tools.execute({
-    callId: CallId(`loader-call-${++callCounter}`),
+    callId: ToolCallId(`loader-call-${++callCounter}`),
     name,
     arguments: args,
     signal: new AbortController().signal,
@@ -143,7 +147,7 @@ describe('real Loader composition through cordis.yml', () => {
     expect(promptTexts(agent).filter(text => text.startsWith('Current stage:')))
       .toEqual(['Current stage: explore\nExplore the problem space and write a plan.'])
     expect(stageNoticeSummaries(agent.session)).toEqual(['Current stage: explore'])
-    expect(foldStage(agent.session.events)).toBe('explore')
+    expect(foldStage(agent.session.snapshotEvents())).toBe('explore')
 
     // Model-visible request variables name the folded stage and the targets.
     const assembly = await assembleFor(ctx, agent)
@@ -158,11 +162,9 @@ describe('real Loader composition through cordis.yml', () => {
   it('reviews goto_stage, writes the handoff, and records the switch durably at the boundary', { timeout: 60_000 }, async () => {
     const { ctx, agent } = await loadComposition()
     const asked: AskUserQuestionRequest[] = []
-    ctx.userQuestions.registerProvider({
-      ask: (request) => {
-        asked.push(request)
-        return Promise.resolve({ answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }] })
-      },
+    ctx.on('user-questions/request', (request) => {
+      asked.push(request)
+      return Promise.resolve({ answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }] })
     })
 
     openTurn(agent.session)
@@ -191,9 +193,9 @@ describe('real Loader composition through cordis.yml', () => {
     ])
 
     // The switch is boundary-applied, not immediate.
-    expect(foldStage(agent.session.events)).toBeUndefined()
+    expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
     await boundary(ctx, agent, 'step-start')
-    expect(foldStage(agent.session.events)).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
     expect(stageNoticeSummaries(agent.session)).toContain('Stage switched to implement')
     const texts = promptTexts(agent)
     expect(texts[0]).toContain(formatPrompt(stageSwitchPrompts.notice.handoffReplaced, {
@@ -212,7 +214,7 @@ describe('real Loader composition through cordis.yml', () => {
       text: formatPrompt(stageSwitchPrompts.command.switched, { target: 'implement' }),
     })
     // The idle commit writes the durable notice the fold reads on resume.
-    expect(foldStage(agent.session.events)).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
     expect(stageNoticeSummaries(agent.session)).toEqual(['Current stage: implement'])
   })
 
@@ -237,6 +239,6 @@ describe('real Loader composition through cordis.yml', () => {
     // appended for the session, and the fold stays where the record left it.
     await boundary(ctx, agent, 'step-start')
     expect(stageNoticeSummaries(agent.session)).toHaveLength(1)
-    expect(foldStage(agent.session.events)).toBe('explore')
+    expect(foldStage(agent.session.snapshotEvents())).toBe('explore')
   })
 })

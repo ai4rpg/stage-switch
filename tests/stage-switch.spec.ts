@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context, Service } from '@deepseek-ai/cordis'
-import { createUserMessage, CallId } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt, { renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { Session, SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
@@ -11,6 +11,7 @@ import UserQuestionService, {
 } from '@deepseek-ai/dsh-user-questions'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
 import type { FsWriteOutcome } from '@deepseek-ai/dsh-fs'
+import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import StageController, { GOTO_STAGE, foldStage, resolveConfig } from '../src/index.ts'
 import type { StageConfig } from '../src/index.ts'
@@ -91,7 +92,7 @@ async function setup(config: StageConfig = STAGE_CONFIG): Promise<Context> {
 let callCounter = 0
 function callStage(ctx: Context, name: string, agent: Agent | undefined, args: Record<string, unknown>) {
   return ctx.tools.execute({
-    callId: CallId(`call-${++callCounter}`),
+    callId: ToolCallId(`call-${++callCounter}`),
     name,
     arguments: args,
     signal: new AbortController().signal,
@@ -107,11 +108,9 @@ function setupWithReview(config: StageConfig = STAGE_CONFIG, answer?: { selected
       await ctx.plugin(UserQuestionService)
       const asked: AskUserQuestionRequest[] = []
       if (answer !== undefined) {
-        ctx.userQuestions.registerProvider({
-          ask: (request) => {
-            asked.push(request)
-            return Promise.resolve({ answers: [{ id: 'stage-review', ...answer }] })
-          },
+        ctx.on('user-questions/request', (request) => {
+          asked.push(request)
+          return Promise.resolve({ answers: [{ id: 'stage-review', ...answer }] })
         })
       }
       const agent = await agentWithSession(ctx, 'agent-1', { cwd: '/workspace' })
@@ -215,14 +214,14 @@ describe('resolveConfig', () => {
 describe('foldStage', () => {
   it('folds to undefined before the first stage record', () => {
     const session = Session.create(SessionId('empty'))
-    expect(foldStage(session.events)).toBeUndefined()
+    expect(foldStage(session.snapshotEvents())).toBeUndefined()
   })
 
   it('honors the end prefix', () => {
     const session = Session.create(SessionId('prefix'))
     appendStageNotice(session, 'Current stage: explore')
     appendStageNotice(session, 'Current stage: implement')
-    expect(foldStage(session.events, 1)).toBe('explore')
+    expect(foldStage(session.snapshotEvents(), 1)).toBe('explore')
   })
 
   /** One stage-switch notice message as every stage entry appends. */
@@ -237,14 +236,14 @@ describe('foldStage', () => {
     const session = Session.create(SessionId('notice-fold'))
     appendStageNotice(session, 'Current stage: explore')
     appendStageNotice(session, 'Current stage: implement')
-    expect(foldStage(session.events)).toBe('implement')
+    expect(foldStage(session.snapshotEvents())).toBe('implement')
   })
 
   it('folds from the handoff notice summary', () => {
     const session = Session.create(SessionId('handoff-fold'))
     appendStageNotice(session, 'Current stage: explore')
     appendStageNotice(session, 'Stage switched to verify')
-    expect(foldStage(session.events)).toBe('verify')
+    expect(foldStage(session.snapshotEvents())).toBe('verify')
   })
 
   it('ignores foreign plugin notices, plain user messages, and malformed summaries', () => {
@@ -261,7 +260,7 @@ describe('foldStage', () => {
       content: [{ type: 'text', text: 'spoof' }],
       source: { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary: 'Stage switched to NOT A STAGE' },
     }), { surfaceOp: 'append' })
-    expect(foldStage(session.events)).toBeUndefined()
+    expect(foldStage(session.snapshotEvents())).toBeUndefined()
   })
 })
 
@@ -451,7 +450,7 @@ describe('goto_stage validation', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     const ask = vi.fn()
-    ctx.userQuestions.registerProvider({ ask: ask as never })
+    ctx.on('user-questions/request', ask as never)
     const agent = await agentWithSession(ctx)
     const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement' })
     expect(result.isError).toBe(true)
@@ -459,7 +458,7 @@ describe('goto_stage validation', () => {
     // guidance: it carries exactly the configured handoff template.
     expect(result.content).toEqual([{ type: 'text', text: toolError(stageSwitchPrompts.errors.requiresHandoff) }])
     expect(ask).not.toHaveBeenCalled()
-    expect(foldStage(agent.session.events)).toBeUndefined()
+    expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
   })
 
   it('degrades to the manual switch when no user-questions seam is composed', async () => {
@@ -474,7 +473,7 @@ describe('goto_stage validation', () => {
     const ctx = await setup()
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
-    ctx.userQuestions.registerProvider({ ask: vi.fn() as never })
+    ctx.on('user-questions/request', vi.fn() as never)
     const agent = await agentWithSession(ctx)
     const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
     expect(result.isError).toBe(true)
@@ -491,12 +490,12 @@ describe('goto_stage validation', () => {
       }
     }
     await ctx.plugin(FailingFs)
-    ctx.userQuestions.registerProvider({ ask: vi.fn() as never })
+    ctx.on('user-questions/request', vi.fn() as never)
     const agent = await agentWithSession(ctx)
     const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([{ type: 'text', text: 'Error: disk full' }])
-    expect(foldStage(agent.session.events)).toBeUndefined()
+    expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
   })
 })
 
@@ -535,10 +534,11 @@ describe('goto_stage presentationMeta (full-transition marker)', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     await ctx.plugin(MemoryFs)
+    await ctx.plugin(SessionProjection)
     await ctx.plugin(TokenMeter)
-    ctx.userQuestions.registerProvider({
-      ask: () => Promise.resolve({ answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }] }),
-    })
+    ctx.on('user-questions/request', () => Promise.resolve({
+      answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }],
+    }))
     const agent = await agentWithSession(ctx, 'light-meta', { cwd: '/workspace' })
     openTurn(agent.session)
     // Below the threshold a transition is light: no handoff, no archive, and
@@ -573,8 +573,8 @@ describe('goto_stage presentationMeta (full-transition marker)', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     await ctx.plugin(MemoryFs)
-    ctx.userQuestions.registerProvider({
-      ask: () => Promise.reject(new UserQuestionError('cancelled', 'ASK_CANCELLED')) })
+    ctx.on('user-questions/request', () =>
+      Promise.reject(new UserQuestionError('cancelled', 'ASK_CANCELLED')))
     const agent = await agentWithSession(ctx, 'dismissed-meta', { cwd: '/workspace' })
     const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
     expect(result.isError).toBe(true)
@@ -619,9 +619,9 @@ describe('goto_stage full transition', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     await ctx.plugin(MemoryFs)
-    ctx.userQuestions.registerProvider({
-      ask: () => Promise.resolve({ answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }] }),
-    })
+    ctx.on('user-questions/request', () => Promise.resolve({
+      answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }],
+    }))
     const first = await agentWithSession(ctx, 'session-aaa', { cwd: '/workspace' })
     const second = await agentWithSession(ctx, 'session-bbb', { cwd: '/workspace' })
     openTurn(first.session)
@@ -642,9 +642,9 @@ describe('goto_stage full transition', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     await ctx.plugin(MemoryFs)
-    ctx.userQuestions.registerProvider({
-      ask: () => Promise.resolve({ answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }] }),
-    })
+    ctx.on('user-questions/request', () => Promise.resolve({
+      answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }],
+    }))
     const agent = await agentWithSession(ctx, 'odd id/../x', { cwd: '/workspace' })
     openTurn(agent.session)
     const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Odd' })
@@ -697,7 +697,7 @@ describe('goto_stage full transition', () => {
     }))
     expect(texts[1]).toBe('boundary probe')
     // The durable log retains the archived history for the human transcript.
-    const archived = agent.session.events.filter(event =>
+    const archived = agent.session.snapshotEvents().filter(event =>
       event.type === 'user/message' && event.data.content.some(
         (block: { type: string; text?: string }) => block.type === 'text' && block.text === 'old work'))
     expect(archived).toHaveLength(1)
@@ -712,11 +712,11 @@ describe('goto_stage full transition', () => {
       handoff: '# Implement\n\n- Completed: exploration',
     })
     expect(result.isError).toBe(false)
-    expect(foldStage(agent.session.events)).toBeUndefined()
+    expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
     await boundary(ctx, agent, 'step-start')
     // The boundary flush writes the handoff notice (summary `Stage switched to
     // <stage>`): the fold restores the stage for resume/fork from the notice alone.
-    expect(foldStage(agent.session.events)).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
   })
 
   it('the review answer must be exactly one Approve without custom text', async () => {
@@ -725,7 +725,7 @@ describe('goto_stage full transition', () => {
     const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([{ type: 'text', text: toolError(formatPrompt(stageSwitchPrompts.errors.keepPlanningFeedback, { feedback: 'revisit the handoff' })) }])
-    expect(foldStage(agent.session.events)).toBeUndefined()
+    expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
   })
 
   it('a dismissed review names the user takeover', async () => {
@@ -733,15 +733,14 @@ describe('goto_stage full transition', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     await ctx.plugin(MemoryFs)
-    ctx.userQuestions.registerProvider({
-      ask: () => Promise.reject(new UserQuestionError(
-        'the user cancelled ask_user_question', 'ASK_CANCELLED')),
-    })
+    ctx.on('user-questions/request', () =>
+      Promise.reject(new UserQuestionError(
+        'the user cancelled ask_user_question', 'ASK_CANCELLED')))
     const agent = await agentWithSession(ctx)
     const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([{ type: 'text', text: toolError(stageSwitchPrompts.errors.dismissed) }])
-    expect(foldStage(agent.session.events)).toBeUndefined()
+    expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
   })
 
   it('fails the call when the plugin is disposed while the review awaits', async () => {
@@ -753,9 +752,7 @@ describe('goto_stage full transition', () => {
     await ctx.plugin(UserQuestionService)
     await ctx.plugin(MemoryFs)
     let answer!: (value: { answers: { id: string; selected: string[] }[] }) => void
-    ctx.userQuestions.registerProvider({
-      ask: () => new Promise((resolve) => { answer = resolve }),
-    })
+    ctx.on('user-questions/request', () => new Promise((resolve) => { answer = resolve }))
     const agent = await agentWithSession(ctx)
     const pending = callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
     await new Promise(resolve => setImmediate(resolve))
@@ -764,7 +761,7 @@ describe('goto_stage full transition', () => {
     const result = await pending
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([{ type: 'text', text: 'Error: the stage-switch service was reloaded while the transition was under review; present the transition again' }])
-    expect(foldStage(agent.session.events)).toBeUndefined()
+    expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
   })
 })
 
@@ -776,13 +773,12 @@ describe('goto_stage token-threshold transitions', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     await ctx.plugin(MemoryFs)
+    await ctx.plugin(SessionProjection)
     await ctx.plugin(TokenMeter)
     const asked: AskUserQuestionRequest[] = []
-    ctx.userQuestions.registerProvider({
-      ask: (request) => {
-        asked.push(request)
-        return Promise.resolve({ answers: [{ id: 'stage-review', ...answer }] })
-      },
+    ctx.on('user-questions/request', (request) => {
+      asked.push(request)
+      return Promise.resolve({ answers: [{ id: 'stage-review', ...answer }] })
     })
     const agent = await agentWithSession(ctx, 'agent-1', { cwd: '/workspace' })
     return { ctx, agent, asked }
@@ -828,7 +824,7 @@ describe('goto_stage token-threshold transitions', () => {
     expect(asked[0]?.questions[0]?.detail).toBeUndefined()
     await boundary(ctx, agent, 'step-start')
     // Stage switched; the conversation history is retained.
-    expect(foldStage(agent.session.events)).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
     const texts = promptTexts(agent)
     expect(texts[0]).toBe('short')
     expect(texts.at(-1)).toBe('boundary probe')
@@ -880,7 +876,7 @@ describe('goto_stage token-threshold transitions', () => {
     const ctx = await setup(THRESHOLD_CONFIG)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
-    ctx.userQuestions.registerProvider({ ask: vi.fn() as never })
+    ctx.on('user-questions/request', vi.fn() as never)
     const agent = await agentWithSession(ctx)
     const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
     expect(result.isError).toBe(true)
@@ -946,13 +942,13 @@ describe('stage command', () => {
       kind: 'success',
       text: formatPrompt(stageSwitchPrompts.command.current, { stage: 'implement', stages: 'explore, implement, verify' }),
     })
-    expect(foldStage(agent.session.events)).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
   })
 
   it('commits the notice summary as the record', async () => {
     const { ctx, agent, signal } = await commandSetup()
     await runCommand(ctx, agent, '/stage implement', signal)
-    const notices = agent.session.events
+    const notices = agent.session.snapshotEvents()
       .filter(event => event.type === 'user/message')
       .map(event => event.data.source)
       .filter(source => source.kind === 'plugin' && source.plugin === 'stage-switch')
@@ -965,7 +961,7 @@ describe('stage command', () => {
     const { ctx, agent, signal } = await commandSetup()
     expect((await runCommand(ctx, agent, '/stage explore', signal))?.result)
       .toEqual({ kind: 'success', text: formatPrompt(stageSwitchPrompts.command.alreadyCurrent, { target: 'explore' }) })
-    expect(foldStage(agent.session.events)).toBeUndefined()
+    expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
   })
 
   it('rejects an unknown stage with the stage list', async () => {
@@ -975,7 +971,7 @@ describe('stage command', () => {
       kind: 'error',
       text: formatPrompt(stageSwitchPrompts.command.unknown, { target: 'ghost', stages: 'explore, implement, verify' }),
     })
-    expect(foldStage(agent.session.events)).toBeUndefined()
+    expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
   })
 
   it('queues a mid-turn selection and flushes it with a switch notice at the boundary', async () => {
@@ -987,12 +983,12 @@ describe('stage command', () => {
     })
     expect((await runCommand(ctx, agent, '/stage implement', signal))?.result)
       .toEqual({ kind: 'success', text: formatPrompt(stageSwitchPrompts.command.queued, { target: 'implement' }) })
-    expect(foldStage(agent.session.events)).toBeUndefined()
+    expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
     await boundary(ctx, agent, 'step-start')
-    expect(foldStage(agent.session.events)).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
     // The boundary appended the stage prompt with the user-switch notice
     // because the last header described the other stage.
-    const notices = agent.session.events
+    const notices = agent.session.snapshotEvents()
       .filter(event => event.type === 'user/message' && event.data.source.kind === 'plugin')
       .map(event => (event.data as { content: { type: string; text?: string }[] }).content.map(block => block.text ?? '').join(''))
     expect(notices).toEqual([
@@ -1007,9 +1003,9 @@ describe('stage command', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     await ctx.plugin(MemoryFs)
-    ctx.userQuestions.registerProvider({
-      ask: () => Promise.resolve({ answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }] }),
-    })
+    ctx.on('user-questions/request', () => Promise.resolve({
+      answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }],
+    }))
     const agent = await agentWithSession(ctx, 'command-tool-narrate', { cwd: '/workspace' })
     openTurn(agent.session)
     agent.session.append('request/header', {
@@ -1019,10 +1015,10 @@ describe('stage command', () => {
     const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
     expect(result.isError).toBe(false)
     await boundary(ctx, agent, 'step-start')
-    expect(foldStage(agent.session.events)).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
     // Only the handoff notice exists; no user-switch narration was injected
     // because the tool result already narrates the transition.
-    const texts = agent.session.events
+    const texts = agent.session.snapshotEvents()
       .filter(event => event.type === 'user/message' && event.data.source.kind === 'plugin')
       .map(event => (event.data as { content: { type: string; text?: string }[] }).content.map(block => block.text ?? '').join(''))
     expect(texts.some(text => text.includes(formatPrompt(stageSwitchPrompts.notice.userSwitchPrefix, { stage: 'implement' })))).toBe(false)

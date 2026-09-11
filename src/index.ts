@@ -375,7 +375,7 @@ export class StageController extends Service {
       // instruction ("classify the request and call goto_stage") is at best
       // redundant and at worst deadlocks the child when its goto_stage review
       // has no user to answer. See isSubagentSession above.
-      if (!hasStagePrompt(session.events) && !isSubagentSession(session)) {
+      if (!hasStagePrompt(session.snapshotEvents()) && !isSubagentSession(session)) {
         return { ...decision, messages: [...decision.messages, this.stagePromptMessage(this.initial, false)] }
       }
       return decision
@@ -638,7 +638,7 @@ export class StageController extends Service {
    * @returns The stage in force.
    */
   current(session: Session): string {
-    return foldStage(session.events) ?? this.initial
+    return foldStage(session.snapshotEvents()) ?? this.initial
   }
 
   /**
@@ -656,7 +656,7 @@ export class StageController extends Service {
   set(agent: Agent, stage: string): 'committed' | 'queued' | 'noop' {
     const session = agent.session
     if (stage === this.current(session)) return 'noop'
-    if (hasOpenTurn(session.events)) {
+    if (hasOpenTurn(session.snapshotEvents())) {
       this.pendingTransitions.set(session, { stage, handoffPath: undefined, narrate: true })
       return 'queued'
     }
@@ -676,7 +676,7 @@ export class StageController extends Service {
   private shouldNarrate(session: Session, stage: string): boolean {
     // Before the first stage record the model was told the initial stage, so
     // the header-stage fold falls back to it.
-    return (stageAtLastHeader(session.events) ?? this.initial) !== stage
+    return (stageAtLastHeader(session.snapshotEvents()) ?? this.initial) !== stage
   }
 
   /**
@@ -797,7 +797,7 @@ export class StageController extends Service {
       return
     }
     session.append('user/message', message, {
-      surfaceOp: { op: 'replace', start: first, end: last },
+      surfaceOp: { op: 'replace', startSeq: first, endSeq: last },
       sourceEventSeqs: nodes,
     })
   }
