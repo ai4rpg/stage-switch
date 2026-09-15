@@ -14,7 +14,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { createSystemMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
+import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
+import { assembleFor } from './shared.ts'
 
 export { mkdtemp, rm, tmpdir, join }
 
@@ -43,4 +46,22 @@ export function makeAgent(ctx: Context, id: string, cwd: string): Agent {
   }
   ctx.agents.register(value)
   return value
+}
+
+/**
+ * Start the session the way the agent loop starts one: the mounted
+ * dsh-system-prompt plugin assembles the prompt for the agent, and the
+ * rendered text enters the surface as the protected `system/message` head.
+ * Every deployment's surface therefore leads with a system node, which the
+ * harness protects against any rewrite but a `system/message` over exactly
+ * that node — the composition cases must see that shape or they cannot catch
+ * a replace that covers it. Only the node append itself is synthesized: the
+ * in-process boot has no app/process leg.
+ */
+export async function appendSystemHead(ctx: Context, agent: Agent): Promise<void> {
+  agent.session.append('system/message', {
+    turn: 0,
+    step: 1,
+    message: createSystemMessage(renderPrompt(await assembleFor(ctx, agent)), '@deepseek-ai/dsh-system-prompt'),
+  }, { surfaceOp: 'append' })
 }

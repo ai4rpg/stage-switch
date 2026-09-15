@@ -31,7 +31,7 @@ import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { FileSystem } from '@deepseek-ai/dsh-fs'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { Session, SessionEvent, UserMessage } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionSeq, UserMessage } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
@@ -363,7 +363,11 @@ export class StageController extends Service {
         try {
           this.onBoundary(session, pending)
         } catch (error) {
-          ctx.logger.warn('dsh-stage-switch: failed to apply stage transition at step start: %o', error)
+          // ERROR level: the plugin logger is not part of the session
+          // transcript, so a silent failure keeps the stage stuck with no
+          // trace anywhere a user can see it. The pending transition stays
+          // queued, so the next accepted pre-step retries the boundary.
+          ctx.logger.error('dsh-stage-switch: failed to apply stage transition at step start: %o', error)
           return decision
         }
         return decision
@@ -440,15 +444,17 @@ export class StageController extends Service {
         // canonical value is deliberately omitted from durable events, so the
         // shape — value.handoffPath present vs absent — is the only signal a
         // full vs light transition leaves behind). A deployment phase machine
-        // (tavern-anchored's compaction-epoch fork) reads it to demote the
-        // next request to a minimal bootstrap catalog for one round — the
-        // notice-carrying request — then a first reply in the new stage
-        // re-promotes. Light transitions, rejected reviews, and dismissed
-        // reviews take other paths (no handoffPath, or the tool errors), so
-        // they carry no `fullTransition` signal. `null` is the lossless no-op
-        // for the light path: the value must be JSON-serializable (the
-        // tool/result event validates every field), so a `return undefined`
-        // would throw at projection time. The consumer keys on
+        // may read it to demote the next request to a minimal bootstrap
+        // catalog for one round — the notice-carrying request — then a first
+        // reply in the new stage re-promotes. Nothing in this package reads
+        // it, but the key stays: it is part of the durable tool/result shape,
+        // and dropping it would break an external reader for no benefit.
+        // Light transitions, rejected reviews, and dismissed reviews take
+        // other paths (no handoffPath, or the tool errors), so they carry no
+        // `fullTransition` signal. `null` is the lossless no-op for the light
+        // path: the value must be JSON-serializable (the tool/result event
+        // validates every field), so a `return undefined` would throw at
+        // projection time. The consumer keys on
         // `meta?.fullTransition === true`, which `null` never satisfies.
         presentationMeta: (_args, value) =>
           typeof value === 'object' && value !== null && 'handoffPath' in value
@@ -781,6 +787,10 @@ export class StageController extends Service {
    * conversation as a single instruction to read the document and knows its
    * new stage. The append-only log retains the full history for the human
    * transcript; only the model-visible surface is shadowed.
+   *
+   * The head node is excluded (see {@link surfaceShadowRange}): a `system
+   * /message` at node 0 is protected by the harness and would reject this
+   * notice, losing the approved transition silently.
    */
   private replaceWithHandoffNotice(session: Session, stage: string, handoffPath: string): void {
     const nodes = [...session.surface.nodes]
@@ -790,16 +800,43 @@ export class StageController extends Service {
       // The summary is the short account a UI can show on a collapsed row.
       source: { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary: `Stage switched to ${stage}` },
     })
-    const first = nodes[0]
-    const last = nodes[nodes.length - 1]
+    const range = this.surfaceShadowRange(session, nodes)
+    const first = range[0]
+    const last = range[range.length - 1]
     if (first === undefined || last === undefined) {
+      // Nothing shadowable — an empty surface, or a surface holding only the
+      // protected head — so the notice appends instead of replacing.
       session.append('user/message', message, { surfaceOp: 'append' })
       return
     }
     session.append('user/message', message, {
       surfaceOp: { op: 'replace', startSeq: first, endSeq: last },
-      sourceEventSeqs: nodes,
+      sourceEventSeqs: range,
     })
+  }
+
+  /**
+   * The surface nodes a handoff notice may shadow: the whole surface, minus a
+   * protected `system/message` head.
+   *
+   * Every real deployment appends the system prompt as node 0 at session
+   * start, and the harness (`surface.ts` `assertSystemHeadRewrite`) only
+   * permits a `system/message` to rewrite exactly that node — a plain
+   * `user/message` notice covering it throws. The replacement is not
+   * catchable from here, so the pending transition retried every pre-step and
+   * the switch never landed (the stage stayed on the old one). The head is
+   * the session prompt, not archived history, so keeping it is the correct
+   * shape: the notice replaces the body, the same shape compaction's replace
+   * uses, which the harness accepts.
+   *
+   * Returns an empty range when there is nothing to shadow — an empty
+   * surface, or a head-only surface — and the caller appends instead.
+   */
+  private surfaceShadowRange(session: Session, nodes: readonly SessionSeq[]): SessionSeq[] {
+    const head = nodes[0]
+    if (head === undefined) return []
+    const headEvent = session.snapshotEvents().find(event => event.seq === head)
+    return headEvent?.type === 'system/message' ? nodes.slice(1) : [...nodes]
   }
 
   /** The stage-prompt body text for one stage (instruction when configured). */

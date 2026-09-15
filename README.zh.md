@@ -35,7 +35,7 @@
 
 ## 边界冲刷
 
-下一个被接受的 in-turn pre-step 会追加目标阶段的提示消息——该消息的 notice summary 就是已提交的阶段记录。完整形态下，它先把整个模型可见 surface 替换为一条提示——`Stage switched to <stage>. The previous conversation was archived. Read the handoff document at <path> before continuing.` 后接新阶段提示——与 compaction checkpoint 使用相同的 surface 替换。append-only 日志为人类转录保留完整历史；只有模型可见 surface 被遮蔽，本次 step 自身的用户消息落在提示之后。替换失败时，已记录的阶段保持不变、切换保持 pending，因此观察不到半应用的切换。
+下一个被接受的 in-turn pre-step 会追加目标阶段的提示消息——该消息的 notice summary 就是已提交的阶段记录。完整形态下，它先把会话系统提示之后的模型可见 surface 替换为一条提示——`Stage switched to <stage>. The previous conversation was archived. Read the handoff document at <path> before continuing.` 后接新阶段提示——与 compaction checkpoint 使用相同的 surface 替换。append-only 日志为人类转录保留完整历史；只有模型可见 surface 被遮蔽，本次 step 自身的用户消息落在提示之后。替换失败时，已记录的阶段保持不变、切换保持 pending，因此观察不到半应用的切换。
 
 ## 配置
 

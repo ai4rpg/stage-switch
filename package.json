@@ -1,7 +1,7 @@
 {
   "name": "@ai4rpg/dsh-stage-switch",
   "description": "Logged per-agent stage collaboration state with eligibility-gated guidance, a handoff document, and a user-reviewed transition",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT",
   "repository": {
     "type": "git",

@@ -38,7 +38,7 @@ Status: implemented
 
 ### 边界冲刷归档模型可见表面
 
-下一个被接受的 in-turn pre-step 会追加新阶段的提示消息（其 notice summary 即已提交的阶段记录）；完整形态下，它先用 `surfaceOp: { op: 'replace', start, end }` 把整个模型可见 surface 替换为一条携带交接指针与新阶段提示的消息——与 compaction checkpoint 使用相同的 surface 替换。append-only 日志为人类转录保留已归档历史；只有派生的模型历史被遮蔽，本次 step 自身的用户消息落在提示之后。替换先于记录消息的 append，因此替换失败时已记录的阶段与 pending 切换都保持不变——观察不到半应用的切换。
+下一个被接受的 in-turn pre-step 会追加新阶段的提示消息（其 notice summary 即已提交的阶段记录）；完整形态下，它先用 `surfaceOp: { op: 'replace', startSeq, endSeq }` 把会话系统提示之后的模型可见 surface 替换为一条携带交接指针与新阶段提示的消息——与 compaction checkpoint 使用相同的 surface 替换。harness 保护 surface 第 0 号节点上的 `system/message`，只允许恰好覆盖该节点的 `system/message` 重写它，因此覆盖该节点的范围会抛错、切换永远落不了地；head 是会话提示而非已归档历史，所以保留它、只遮蔽正文。surface 只剩 head 时改为追加提示。append-only 日志为人类转录保留已归档历史；只有派生的模型历史被遮蔽，本次 step 自身的用户消息落在提示之后。替换先于记录消息的 append，因此替换失败时已记录的阶段与 pending 切换都保持不变——观察不到半应用的切换。
 
 ### 持久化的 full-transition 标记（`output.presentationMeta`）
 

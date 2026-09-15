@@ -35,7 +35,7 @@ When `ctx.commands` is composed, the package registers `/stage [stage|message]`.
 
 ## The boundary flush
 
-The next accepted in-turn pre-step appends the target stage's prompt message — that message's notice summary is the committed stage record. In the full shape it first replaces the whole model-visible surface with one notice — `Stage switched to <stage>. The previous conversation was archived. Read the handoff document at <path> before continuing.` followed by the new stage prompt — using the same surface replacement as compaction checkpoints. The append-only log retains the full history for the human transcript; only the model-visible surface is shadowed, and the step's own user messages land after the notice. A failed replacement leaves the logged stage untouched and the transition pending, so no half-applied switch is observable.
+The next accepted in-turn pre-step appends the target stage's prompt message — that message's notice summary is the committed stage record. In the full shape it first replaces the model-visible surface behind the session's system prompt with one notice — `Stage switched to <stage>. The previous conversation was archived. Read the handoff document at <path> before continuing.` followed by the new stage prompt — using the same surface replacement as compaction checkpoints. The append-only log retains the full history for the human transcript; only the model-visible surface is shadowed, and the step's own user messages land after the notice. A failed replacement leaves the logged stage untouched and the transition pending, so no half-applied switch is observable.
 
 ## Configuration
 

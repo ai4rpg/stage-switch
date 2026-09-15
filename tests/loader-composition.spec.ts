@@ -10,7 +10,12 @@
 // plugins; stage-switch loads exactly as a deployment loads it. What stands
 // in for the outside world: the filesystem backend (MemoryFs) and the review
 // answers (a user-questions answerer listener — a human is the
-// nondeterministic input).
+// nondeterministic input). Each session also starts the way the agent loop
+// starts one — the mounted system-prompt plugin assembles the prompt and it
+// enters the surface as the protected `system/message` head — so the
+// full-transition replace is pinned against the head shape every deployment
+// has. Only the node append itself is synthesized; the in-process boot has no
+// app/process leg.
 //
 // The specifier→module resolution is pinned to already-imported source
 // modules via `loader.internal.import` (the testing policy's source plane:
@@ -29,7 +34,7 @@ import '@deepseek-ai/cordis-plugin-loader'
 import '@deepseek-ai/cordis-plugin-include'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import SessionStore, { Session } from '@deepseek-ai/dsh-session'
 import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -42,7 +47,9 @@ import {
   APPROVE_LABEL, MemoryFs, STAGE_CONFIG, TEST_STAGES,
   assembleFor, boundary, openTurn, promptTexts, stageNoticeSummaries,
 } from './helpers/shared.ts'
-import { makeAgent, mkdtemp, rm, tmpdir, join } from './helpers/loader-composition.ts'
+import {
+  appendSystemHead, makeAgent, mkdtemp, rm, tmpdir, join,
+} from './helpers/loader-composition.ts'
 
 let root: string | undefined
 let context: Context | undefined
@@ -113,6 +120,8 @@ async function loadComposition(): Promise<{ ctx: Context; agent: Agent & { sessi
     if (context.commands.list(agent).some(command => command.name === 'stage')) break
     await new Promise(resolve => setTimeout(resolve, 10))
   }
+  // Every real session leads with the system prompt, so every case here does.
+  await appendSystemHead(context, agent)
   return { ctx: context, agent }
 }
 
@@ -167,7 +176,18 @@ describe('real Loader composition through cordis.yml', () => {
       return Promise.resolve({ answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }] })
     })
 
+    // The session leads with the system prompt the loop appends at session
+    // start: the protected head the full-transition replace must skip.
+    expect(agent.session.surface.nodes).toHaveLength(1)
+    const headText = promptTexts(agent)[0]
+    expect(headText).toBeDefined()
     openTurn(agent.session)
+    // The turn's user message is already on the surface when the model calls
+    // goto_stage, so the replace shadows a real body behind the head.
+    agent.session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'old work' }],
+      source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
     const handoff = '# Implement\n\n- Completed: exploration'
     const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff })
     expect(result.isError).toBe(false)
@@ -198,12 +218,50 @@ describe('real Loader composition through cordis.yml', () => {
     expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
     expect(stageNoticeSummaries(agent.session)).toContain('Stage switched to implement')
     const texts = promptTexts(agent)
-    expect(texts[0]).toContain(formatPrompt(stageSwitchPrompts.notice.handoffReplaced, {
+    // The protected head survived in front of the notice, and only the body
+    // was shadowed: a replace range covering node 0 throws in the harness and
+    // the approved transition would never land.
+    expect(texts[0]).toBe(headText)
+    expect(texts[1]).toContain(formatPrompt(stageSwitchPrompts.notice.handoffReplaced, {
       stage: 'implement',
       path: '/workspace/handoff/agent-1/implement.md',
     }))
     // The step's own user message lands after the handoff notice.
     expect(texts.at(-1)).toBe('boundary probe')
+    expect(agent.session.surface.nodes).toHaveLength(3)
+    // The archived body stays in the durable log for the human transcript.
+    expect(agent.session.snapshotEvents().some(event =>
+      event.type === 'user/message' && event.data.content.some(
+        (block: { type: string; text?: string }) => block.type === 'text' && block.text === 'old work'))).toBe(true)
+  })
+
+  it('appends the handoff notice when the surface holds only the system prompt', { timeout: 60_000 }, async () => {
+    const { ctx, agent } = await loadComposition()
+    ctx.on('user-questions/request', () => Promise.resolve({
+      answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }],
+    }))
+
+    const headText = promptTexts(agent)[0]
+    expect(headText).toBeDefined()
+    // No turn message yet, so there is no body to shadow: the notice appends
+    // behind the protected head instead of replacing it.
+    expect(agent.session.surface.nodes).toHaveLength(1)
+    openTurn(agent.session)
+    const result = await callStage(ctx, GOTO_STAGE, agent, {
+      stage: 'implement',
+      handoff: '# Implement\n\n- Completed: exploration',
+    })
+    expect(result.isError).toBe(false)
+    await boundary(ctx, agent, 'step-start')
+    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
+    const texts = promptTexts(agent)
+    expect(texts[0]).toBe(headText)
+    expect(texts[1]).toContain(formatPrompt(stageSwitchPrompts.notice.handoffReplaced, {
+      stage: 'implement',
+      path: '/workspace/handoff/agent-1/implement.md',
+    }))
+    expect(texts.at(-1)).toBe('boundary probe')
+    expect(agent.session.surface.nodes).toHaveLength(3)
   })
 
   it('switches an idle session immediately through the real command runtime', { timeout: 60_000 }, async () => {
