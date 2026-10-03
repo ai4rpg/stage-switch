@@ -41,6 +41,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import UserQuestionService, { type AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
+import { assertV4RowAdmission } from '@deepseek-ai/dsh-session-format-v3-to-v4'
 import StageController, { GOTO_STAGE, foldStage } from '../src/index.ts'
 import { stageSwitchPrompts, formatPrompt } from '../src/prompts.ts'
 import {
@@ -233,6 +234,39 @@ describe('real Loader composition through cordis.yml', () => {
     expect(agent.session.snapshotEvents().some(event =>
       event.type === 'user/message' && event.data.content.some(
         (block: { type: string; text?: string }) => block.type === 'text' && block.text === 'old work'))).toBe(true)
+  })
+
+  it('writes durable stage records that native V4 row admission accepts', { timeout: 60_000 }, async () => {
+    // Session format V4 refuses the retired shared `{ kind: 'plugin', plugin }`
+    // source wrapper at the persistence writer, so a stage record the in-memory
+    // Session accepts can still fail in every real deployment. This case feeds
+    // the records of every producer path through the shipping V4 admission and
+    // pins both directions: our producer-owned kind is admitted, the retired
+    // wrapper is refused.
+    const { ctx, agent } = await loadComposition()
+    ctx.on('user-questions/request', () => Promise.resolve({
+      answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }],
+    }))
+    await boundary(ctx, agent, 'pre-step')
+    await ctx.commands.execute(agent, '/stage verify', [], new AbortController().signal)
+    openTurn(agent.session)
+    await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    await boundary(ctx, agent, 'step-start')
+
+    const messages = agent.session.snapshotEvents()
+      .flatMap(event => event.type === 'user/message' ? [event.data] : [])
+    expect(stageNoticeSummaries(agent.session)).toHaveLength(3)
+    for (const message of messages) {
+      expect(() => assertV4RowAdmission({ type: 'user/message', data: message })).not.toThrow()
+    }
+    expect(() => assertV4RowAdmission({
+      type: 'user/message',
+      data: {
+        id: 'legacy-shape',
+        content: [{ type: 'text', text: 'Current stage: explore' }],
+        source: { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary: 'Current stage: explore' },
+      },
+    })).toThrow(/producer-owned source kind/)
   })
 
   it('appends the handoff notice when the surface holds only the system prompt', { timeout: 60_000 }, async () => {

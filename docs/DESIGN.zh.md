@@ -16,7 +16,7 @@ Status: implemented
 
 ### 本包：`@ai4rpg/dsh-stage-switch`
 
-本包独立开发与发布，构建与发布均针对 npm 上的 `@deepseek-ai/dsh-*` 包：与 plan mode 一样，是通过 session、prompt、tool 与 interaction seam 贡献的、记录到日志的按 agent 协作状态。持久事实是每次进入都会追加的阶段提示消息——`Current stage: <name>` 或交接提示 `Stage switched to <name>` 两种 `user/message`，其 `source.summary` 由 `foldStage(events)` 折叠，空日志值取配置的 `initial` 阶段。`ctx.stage.current(session)` 读取当前状态。
+本包独立开发与发布，构建与发布均针对 npm 上的 `@deepseek-ai/dsh-*` 包：与 plan mode 一样，是通过 session、prompt、tool 与 interaction seam 贡献的、记录到日志的按 agent 协作状态。持久事实是每次进入都会追加的阶段提示消息——`Current stage: <name>` 或交接提示 `Stage switched to <name>` 两种 `user/message`，其 `source.summary` 由 `foldStage(events)` 折叠，空日志值取配置的 `initial` 阶段。记录的 source 为生产者自有（`kind: 'stage-switch'`、`notice` 形态）；更早版本写入的记录经 harness 的 V3→V4 会话转换后以 `plugin:stage-switch` 返回，`foldStage` 同时接受两种 kind，因此旧会话 resume 仍落在其记录的阶段上。`ctx.stage.current(session)` 读取当前状态。
 
 ### 解耦的判定器 seam
 

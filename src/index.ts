@@ -31,6 +31,7 @@ import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { FileSystem } from '@deepseek-ai/dsh-fs'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed, MessageSource } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionSeq, UserMessage } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
@@ -44,6 +45,23 @@ import type {} from '@deepseek-ai/dsh-commands'
 declare module '@deepseek-ai/cordis' {
   interface Context {
     stage: StageController
+  }
+}
+
+/**
+ * Stage records are producer-owned user messages: their `kind` names this
+ * plugin. The shared `{ kind: 'plugin', plugin }` wrapper is retired in
+ * session format V4; both current and migrated kinds are declared because a
+ * durable log can carry either. New writes use `stage-switch`; the V3→V4
+ * session migration names this plugin's released records
+ * `plugin:stage-switch` (the prefix it gives a producer it does not know), so
+ * a resumed session still folds to its recorded stage. `ContextFormed` is the
+ * shared form mixin — stage records are `notice`s carrying a summary.
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'stage-switch': { kind: 'stage-switch' } & ContextFormed
+    'plugin:stage-switch': { kind: 'plugin:stage-switch' } & ContextFormed
   }
 }
 
@@ -209,8 +227,27 @@ export function foldStage(events: readonly SessionEvent[], end = events.length):
 
 /** Summary shapes the two stage-switch message producers stamp; the captured
  * name matches the `StageDefinition` name grammar, so a hand-edited or foreign
- * summary cannot smuggle in a bogus stage. */
-const STAGE_SUMMARY = /^(?:Current stage: |Stage switched to )([a-z][a-z0-9_-]*)$/
+ * summary cannot smuggle in a bogus stage. Exported with the source kinds as
+ * the fold contract shared with the sidebar client package. */
+export const STAGE_SUMMARY = /^(?:Current stage: |Stage switched to )([a-z][a-z0-9_-]*)$/
+
+/**
+ * Producer kinds a stage record can carry. `stage-switch` is what every new
+ * write uses; `plugin:stage-switch` is what the V3→V4 session migration makes
+ * of this plugin's released records, so a resumed old session still folds to
+ * its recorded stage (see the module augmentation above). Exported as the
+ * cross-package fold contract: the sidebar client package pins its browser
+ * copy against this source of truth.
+ */
+export const STAGE_SOURCE_KINDS: ReadonlySet<string> = new Set(['stage-switch', 'plugin:stage-switch'])
+
+/** The `notice` summary a stage record carries, or undefined for any other message. */
+function stageSummaryOf(source: MessageSource): string | undefined {
+  if (!STAGE_SOURCE_KINDS.has(source.kind)) return undefined
+  const formed = source as { form?: string; summary?: unknown }
+  if (formed.form !== 'notice' || typeof formed.summary !== 'string') return undefined
+  return formed.summary
+}
 
 /**
  * The stage one log entry records, or `undefined` when it records none.
@@ -223,10 +260,9 @@ const STAGE_SUMMARY = /^(?:Current stage: |Stage switched to )([a-z][a-z0-9_-]*)
  */
 function stageFromEvent(event: SessionEvent): string | undefined {
   if (event.type !== 'user/message') return undefined
-  const source = event.data.source
-  if (source.kind !== 'plugin' || source.plugin !== 'stage-switch' || source.form !== 'notice') return undefined
-  const stage = STAGE_SUMMARY.exec(source.summary)?.[1]
-  return stage
+  const summary = stageSummaryOf(event.data.source)
+  if (summary === undefined) return undefined
+  return STAGE_SUMMARY.exec(summary)?.[1]
 }
 
 /** Whether the log holds an opened turn without its closing `turn/end`. */
@@ -255,8 +291,7 @@ function stageAtLastHeader(events: readonly SessionEvent[]): string | undefined 
 function hasStagePrompt(events: readonly SessionEvent[]): boolean {
   for (const event of events) {
     if (event.type !== 'user/message') continue
-    const source = event.data.source
-    if (source.kind !== 'plugin' || source.plugin !== 'stage-switch') continue
+    if (!STAGE_SOURCE_KINDS.has(event.data.source.kind)) continue
     const text = event.data.content
       .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
       .map(block => block.text)
@@ -704,7 +739,7 @@ export class StageController extends Service {
     return createUserMessage({
       content: [{ type: 'text', text }],
       // The summary is the short account a UI can show on a collapsed row.
-      source: { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary: `Current stage: ${stage}` },
+      source: { kind: 'stage-switch', form: 'notice', summary: `Current stage: ${stage}` },
     })
   }
 
@@ -798,7 +833,7 @@ export class StageController extends Service {
     const message = createUserMessage({
       content: [{ type: 'text', text }],
       // The summary is the short account a UI can show on a collapsed row.
-      source: { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary: `Stage switched to ${stage}` },
+      source: { kind: 'stage-switch', form: 'notice', summary: `Stage switched to ${stage}` },
     })
     const range = this.surfaceShadowRange(session, nodes)
     const first = range[0]

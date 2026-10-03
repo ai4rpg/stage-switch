@@ -16,7 +16,7 @@ Long-horizon work needs explicit stage boundaries: a planning stage, an implemen
 
 ### The package: `@ai4rpg/dsh-stage-switch`
 
-The package is developed and published standalone against the npm `@deepseek-ai/dsh-*` packages: like plan mode, it is a logged per-agent collaboration state contributed through the session, prompt, tool, and interaction seams. The durable fact is the stage notice every entry appends — the stage prompt or handoff notice `user/message`, whose `source.summary` (`Current stage: <name>` / `Stage switched to <name>`) is folded by `foldStage(events)` with the configured `initial` stage as the empty-log value. `ctx.stage.current(session)` reads the state in force.
+The package is developed and published standalone against the npm `@deepseek-ai/dsh-*` packages: like plan mode, it is a logged per-agent collaboration state contributed through the session, prompt, tool, and interaction seams. The durable fact is the stage notice every entry appends — the stage prompt or handoff notice `user/message`, whose `source.summary` (`Current stage: <name>` / `Stage switched to <name>`) is folded by `foldStage(events)` with the configured `initial` stage as the empty-log value. The record's source is producer-owned (`kind: 'stage-switch'`, `notice` form); records written by earlier releases come back from the harness's V3→V4 session conversion as `plugin:stage-switch`, and `foldStage` accepts both kinds so a resumed old session still lands on its recorded stage. `ctx.stage.current(session)` reads the state in force.
 
 ### Decoupled eligibility seam
 

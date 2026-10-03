@@ -62,6 +62,6 @@ export async function appendSystemHead(ctx: Context, agent: Agent): Promise<void
   agent.session.append('system/message', {
     turn: 0,
     step: 1,
-    message: createSystemMessage(renderPrompt(await assembleFor(ctx, agent)), '@deepseek-ai/dsh-system-prompt'),
+    message: createSystemMessage(renderPrompt(await assembleFor(ctx, agent))),
   }, { surfaceOp: 'append' })
 }

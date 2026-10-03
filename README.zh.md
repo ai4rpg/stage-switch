@@ -8,7 +8,7 @@
 
 ## 持久状态
 
-阶段记录搭载在每次阶段进入都会追加的 stage-switch 插件消息上——阶段提示（`Current stage: <name>`）或交接提示（`Stage switched to <name>`），都是官方 harness 事件目录已知的普通 `user/message`。`foldStage(events)` 返回最后一条记录的阶段，无记录时为 `undefined`；服务在第一条记录之前折叠到配置的 `initial` 阶段（默认第一个阶段），因此 resume、fork 与 compaction 直接从会话日志恢复阶段。UI 通过 `session/event` 观察已提交的切换。
+阶段记录搭载在每次阶段进入都会追加的 stage-switch 插件消息上——阶段提示（`Current stage: <name>`）或交接提示（`Stage switched to <name>`），都是官方 harness 事件目录已知的普通 `user/message`。每条记录的 source 为生产者自有：`kind: 'stage-switch'`，`notice` 形态并携带 summary。更早版本写入的记录经 harness 的 V3→V4 会话转换后以 `plugin:stage-switch` 返回；`foldStage` 同时接受两种 kind，因此旧会话 resume 仍落在其记录的阶段上。`foldStage(events)` 返回最后一条记录的阶段，无记录时为 `undefined`；服务在第一条记录之前折叠到配置的 `initial` 阶段（默认第一个阶段），因此 resume、fork 与 compaction 直接从会话日志恢复阶段。UI 通过 `session/event` 观察已提交的切换。
 `ctx.stage.current(session)` 读取当前阶段。已评审的切换保持 pending，在下一个被接受的 in-turn pre-step 应用，因此当前工具批次保持其阶段上下文，切换由工具结果自身叙述。
 
 ## 判定器 seam

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import SystemPrompt, { renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { Session, SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
@@ -21,6 +22,13 @@ import {
   APPROVE_LABEL, KEEP_LABEL, MemoryFs, STAGE_CONFIG,
   assembleFor, boundary, openTurn, promptTexts,
 } from './helpers/shared.ts'
+
+/** Test-only foreign producer: a notice another plugin owns must never fold. */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'other-plugin': { kind: 'other-plugin' } & ContextFormed
+  }
+}
 
 /**
  * In-memory sandbox-policy service: resolves the per-session standing policy
@@ -73,10 +81,10 @@ async function agentWithSession(
   ;(agent as { ctx?: Context }).ctx = scoped
   const agents = ctx.get('agents')
   if (agents === undefined) {
-    ctx.emit('agent/created', { agent })
+    ctx.emit('agent/created', { agent, source: 'startup' })
   } else {
     agents.enter(agent, owner)
-    agents.announce(agent)
+    await agents.announce(agent, 'startup')
   }
   return agent
 }
@@ -228,7 +236,7 @@ describe('foldStage', () => {
   function appendStageNotice(session: Session, summary: string): void {
     session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: summary }],
-      source: { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary },
+      source: { kind: 'stage-switch', form: 'notice', summary },
     }), { surfaceOp: 'append' })
   }
 
@@ -237,6 +245,15 @@ describe('foldStage', () => {
     appendStageNotice(session, 'Current stage: explore')
     appendStageNotice(session, 'Current stage: implement')
     expect(foldStage(session.snapshotEvents())).toBe('implement')
+  })
+
+  it('folds records the V3→V4 migration rewrote to plugin:stage-switch', () => {
+    const session = Session.create(SessionId('migrated-fold'))
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'Current stage: verify' }],
+      source: { kind: 'plugin:stage-switch', form: 'notice', summary: 'Current stage: verify' },
+    }), { surfaceOp: 'append' })
+    expect(foldStage(session.snapshotEvents())).toBe('verify')
   })
 
   it('folds from the handoff notice summary', () => {
@@ -254,11 +271,11 @@ describe('foldStage', () => {
     }), { surfaceOp: 'append' })
     session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'spoof' }],
-      source: { kind: 'plugin', plugin: 'other-plugin', form: 'notice', summary: 'Current stage: ghost' },
+      source: { kind: 'other-plugin', form: 'notice', summary: 'Current stage: ghost' },
     }), { surfaceOp: 'append' })
     session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'spoof' }],
-      source: { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary: 'Stage switched to NOT A STAGE' },
+      source: { kind: 'stage-switch', form: 'notice', summary: 'Stage switched to NOT A STAGE' },
     }), { surfaceOp: 'append' })
     expect(foldStage(session.snapshotEvents())).toBeUndefined()
   })
@@ -935,7 +952,7 @@ describe('stage command', () => {
     const { ctx, agent, signal } = await commandSetup()
     agent.session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'Current stage: implement' }],
-      source: { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary: 'Current stage: implement' },
+      source: { kind: 'stage-switch', form: 'notice', summary: 'Current stage: implement' },
     }), { surfaceOp: 'append' })
     const result = await runCommand(ctx, agent, '/stage', signal)
     expect(result?.result).toEqual({
@@ -951,7 +968,7 @@ describe('stage command', () => {
     const notices = agent.session.snapshotEvents()
       .filter(event => event.type === 'user/message')
       .map(event => event.data.source)
-      .filter(source => source.kind === 'plugin' && source.plugin === 'stage-switch')
+      .filter(source => source.kind === 'stage-switch')
     expect(notices).toEqual([
       expect.objectContaining({ form: 'notice', summary: 'Current stage: implement' }),
     ])
@@ -989,7 +1006,7 @@ describe('stage command', () => {
     // The boundary appended the stage prompt with the user-switch notice
     // because the last header described the other stage.
     const notices = agent.session.snapshotEvents()
-      .filter(event => event.type === 'user/message' && event.data.source.kind === 'plugin')
+      .filter(event => event.type === 'user/message' && event.data.source.kind === 'stage-switch')
       .map(event => (event.data as { content: { type: string; text?: string }[] }).content.map(block => block.text ?? '').join(''))
     expect(notices).toEqual([
       formatPrompt(stageSwitchPrompts.notice.userSwitchPrefix, { stage: 'implement' })
@@ -1019,7 +1036,7 @@ describe('stage command', () => {
     // Only the handoff notice exists; no user-switch narration was injected
     // because the tool result already narrates the transition.
     const texts = agent.session.snapshotEvents()
-      .filter(event => event.type === 'user/message' && event.data.source.kind === 'plugin')
+      .filter(event => event.type === 'user/message' && event.data.source.kind === 'stage-switch')
       .map(event => (event.data as { content: { type: string; text?: string }[] }).content.map(block => block.text ?? '').join(''))
     expect(texts.some(text => text.includes(formatPrompt(stageSwitchPrompts.notice.userSwitchPrefix, { stage: 'implement' })))).toBe(false)
     expect(texts.some(text => text.includes(formatPrompt(stageSwitchPrompts.notice.handoffReplaced, {

@@ -176,6 +176,6 @@ export function stageNoticeSummaries(session: Session): string[] {
   return session.snapshotEvents()
     .filter(event => event.type === 'user/message')
     .map(event => event.data as UserMessage)
-    .filter(message => message.source.kind === 'plugin' && message.source.plugin === 'stage-switch')
+    .filter(message => message.source.kind === 'stage-switch')
     .map(message => (message.source as { summary?: string }).summary ?? '')
 }
