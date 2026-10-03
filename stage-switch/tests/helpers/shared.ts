@@ -19,11 +19,30 @@ import type { FsTarget, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-f
 import type { StageConfig, StageDefinition } from '../../src/index.ts'
 import { stageSwitchPrompts } from '../../src/prompts.ts'
 
-export const TEST_STAGES: StageDefinition[] = [
-  { name: 'explore', instruction: 'Explore the problem space and write a plan.' },
-  { name: 'implement', instruction: 'Implement the approved plan.' },
-  { name: 'verify', instruction: 'Verify the implementation with tests.' },
-]
+/**
+ * The stage names every tier configures. They are deliberately abstract
+ * placeholders, not a vocabulary borrowed from any deployment: the package
+ * never interprets a stage name beyond the `[a-z][a-z0-9_-]*` grammar, so a
+ * suite that depends on what the names *mean* would be pinning something the
+ * plugin does not do. Order is load-bearing (`initial` defaults to the first
+ * stage, `stage_targets` is the rest), so this array is the single source of
+ * truth and every assertion derives from it.
+ */
+export const STAGE_NAMES = ['alpha', 'beta', 'gamma'] as const
+
+/** The stage instruction text for one name — also generated, never asserted twice. */
+export function stageInstruction(name: string): string {
+  return `Instruction for the ${name} stage.`
+}
+
+/** The configured catalog: three stages built from {@link STAGE_NAMES}. */
+export const TEST_STAGES: StageDefinition[] = STAGE_NAMES.map(name => ({
+  name,
+  instruction: stageInstruction(name),
+}))
+
+/** Positional aliases for readability where a case means "the first/last stage". */
+export const [STAGE_FIRST, STAGE_SECOND, STAGE_THIRD] = STAGE_NAMES
 export const STAGE_CONFIG = {
   stages: TEST_STAGES,
   section: 'The current stage is complete. Call goto_stage to switch to a target stage.',

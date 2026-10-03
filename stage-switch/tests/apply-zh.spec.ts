@@ -258,9 +258,9 @@ describe('REAL load-chain: runtime reads the zh overlay after applyZh', () => {
     const { formatPrompt } = await import(
       pathToFileURL(join(fix, 'src', 'prompts.ts')).href
     )
-    const formatted = formatPrompt(stageSwitchPrompts.review.fullQuestion, { stage: 'design' })
-    expect(formatted).toContain('design')
-    expect(formatted).toBe('批准切换到「design」阶段并归档当前会话？')
+    const formatted = formatPrompt(stageSwitchPrompts.review.fullQuestion, { stage: 'placeholder-stage' })
+    expect(formatted).toContain('placeholder-stage')
+    expect(formatted).toBe('批准切换到「placeholder-stage」阶段并归档当前会话？')
   })
 
   it('the loaded DEFAULT_STAGE_SWITCH_PROMPTS is still English (unchanged)', async () => {

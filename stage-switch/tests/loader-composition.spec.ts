@@ -48,8 +48,8 @@ import { stageSwitchPrompts, formatPrompt, resolveStageSwitchPrompts } from '../
 /** The Chinese dictionary the zh composition case expects, derived from the same resolver the service uses. */
 const ZH = resolveStageSwitchPrompts('zh')
 import {
-  APPROVE_LABEL, MemoryFs, STAGE_CONFIG, TEST_STAGES,
-  assembleFor, boundary, openTurn, promptTexts, stageNoticeSummaries,
+  APPROVE_LABEL, MemoryFs, STAGE_CONFIG, STAGE_FIRST, STAGE_NAMES, STAGE_SECOND, STAGE_THIRD, TEST_STAGES,
+  assembleFor, boundary, openTurn, promptTexts, stageInstruction, stageNoticeSummaries,
 } from './helpers/shared.ts'
 import {
   appendSystemHead, makeAgent, mkdtemp, rm, tmpdir, join,
@@ -161,21 +161,21 @@ describe('real Loader composition through cordis.yml', () => {
     // stage-switch notice — the single record the fold reads on resume.
     await boundary(ctx, agent, 'pre-step')
     expect(promptTexts(agent).filter(text => text.startsWith('Current stage:')))
-      .toEqual(['Current stage: explore\nExplore the problem space and write a plan.'])
-    expect(stageNoticeSummaries(agent.session)).toEqual(['Current stage: explore'])
-    expect(foldStage(agent.session.snapshotEvents())).toBe('explore')
+      .toEqual([`Current stage: ${STAGE_FIRST}\n${stageInstruction(STAGE_FIRST)}`])
+    expect(stageNoticeSummaries(agent.session)).toEqual([`Current stage: ${STAGE_FIRST}`])
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_FIRST)
 
     // The read path is the session-projection seam: the service's reads go
     // through the registered `stage` unit (the harness deprecated the
     // synchronous whole-log readers), so the composition pins that the unit
     // is live and carries the folded state the service reads.
     expect(ctx.sessionProjections.stateOf(agent.session, 'stage'))
-      .toMatchObject({ stage: 'explore', hasStagePrompt: true })
+      .toMatchObject({ stage: STAGE_FIRST, hasStagePrompt: true })
 
     // Model-visible request variables name the folded stage and the targets.
     const assembly = await assembleFor(ctx, agent)
-    expect(assembly.variables['stage_current']).toBe('explore')
-    expect(assembly.variables['stage_targets']).toBe('implement, verify')
+    expect(assembly.variables['stage_current']).toBe(STAGE_FIRST)
+    expect(assembly.variables['stage_targets']).toBe(STAGE_NAMES.slice(1).join(', '))
 
     // The second boundary carries no prompt: the log already has one.
     await boundary(ctx, agent, 'pre-step')
@@ -203,15 +203,15 @@ describe('real Loader composition through cordis.yml', () => {
       source: { kind: 'user' },
     }), { surfaceOp: 'append' })
     const handoff = '# Implement\n\n- Completed: exploration'
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff })
     expect(result.isError).toBe(false)
     if (result.isError) throw new Error('expected approved transition')
-    expect(result.value).toMatchObject({ approved: true, stage: 'implement' })
-    expect((result.value as { handoffPath: string }).handoffPath).toBe('/workspace/handoff/agent-1/implement.md')
+    expect(result.value).toMatchObject({ approved: true, stage: STAGE_SECOND })
+    expect((result.value as { handoffPath: string }).handoffPath).toBe(`/workspace/handoff/agent-1/${STAGE_SECOND}.md`)
 
     // The handoff document reached the fs service before the review, byte-exact.
     const fs = ctx.get('fs') as MemoryFs
-    expect(fs.writes).toEqual([{ path: '/workspace/handoff/agent-1/implement.md', content: handoff }])
+    expect(fs.writes).toEqual([{ path: `/workspace/handoff/agent-1/${STAGE_SECOND}.md`, content: handoff }])
 
     // The review went through the real user-questions seam, addressed to the
     // calling agent, carrying the handoff as detail.
@@ -229,16 +229,16 @@ describe('real Loader composition through cordis.yml', () => {
     // The switch is boundary-applied, not immediate.
     expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
     await boundary(ctx, agent, 'step-start')
-    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
-    expect(stageNoticeSummaries(agent.session)).toContain('Stage switched to implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_SECOND)
+    expect(stageNoticeSummaries(agent.session)).toContain(`Stage switched to ${STAGE_SECOND}`)
     const texts = promptTexts(agent)
     // The protected head survived in front of the notice, and only the body
     // was shadowed: a replace range covering node 0 throws in the harness and
     // the approved transition would never land.
     expect(texts[0]).toBe(headText)
     expect(texts[1]).toContain(formatPrompt(stageSwitchPrompts.notice.handoffReplaced, {
-      stage: 'implement',
-      path: '/workspace/handoff/agent-1/implement.md',
+      stage: STAGE_SECOND,
+      path: `/workspace/handoff/agent-1/${STAGE_SECOND}.md`,
     }))
     // The step's own user message lands after the handoff notice.
     expect(texts.at(-1)).toBe('boundary probe')
@@ -261,9 +261,9 @@ describe('real Loader composition through cordis.yml', () => {
       answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }],
     }))
     await boundary(ctx, agent, 'pre-step')
-    await ctx.commands.execute(agent, '/stage verify', [], new AbortController().signal)
+    await ctx.commands.execute(agent, `/stage ${STAGE_THIRD}`, [], new AbortController().signal)
     openTurn(agent.session)
-    await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff' })
     await boundary(ctx, agent, 'step-start')
 
     const messages = agent.session.snapshotEvents()
@@ -276,8 +276,8 @@ describe('real Loader composition through cordis.yml', () => {
       type: 'user/message',
       data: {
         id: 'legacy-shape',
-        content: [{ type: 'text', text: 'Current stage: explore' }],
-        source: { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary: 'Current stage: explore' },
+        content: [{ type: 'text', text: `Current stage: ${STAGE_FIRST}` }],
+        source: { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary: `Current stage: ${STAGE_FIRST}` },
       },
     })).toThrow(/producer-owned source kind/)
   })
@@ -295,17 +295,17 @@ describe('real Loader composition through cordis.yml', () => {
     expect(agent.session.surface.nodes).toHaveLength(1)
     openTurn(agent.session)
     const result = await callStage(ctx, GOTO_STAGE, agent, {
-      stage: 'implement',
+      stage: STAGE_SECOND,
       handoff: '# Implement\n\n- Completed: exploration',
     })
     expect(result.isError).toBe(false)
     await boundary(ctx, agent, 'step-start')
-    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_SECOND)
     const texts = promptTexts(agent)
     expect(texts[0]).toBe(headText)
     expect(texts[1]).toContain(formatPrompt(stageSwitchPrompts.notice.handoffReplaced, {
-      stage: 'implement',
-      path: '/workspace/handoff/agent-1/implement.md',
+      stage: STAGE_SECOND,
+      path: `/workspace/handoff/agent-1/${STAGE_SECOND}.md`,
     }))
     expect(texts.at(-1)).toBe('boundary probe')
     expect(agent.session.surface.nodes).toHaveLength(3)
@@ -313,14 +313,14 @@ describe('real Loader composition through cordis.yml', () => {
 
   it('switches an idle session immediately through the real command runtime', { timeout: 60_000 }, async () => {
     const { ctx, agent } = await loadComposition()
-    const result = await ctx.commands.execute(agent, '/stage implement', [], new AbortController().signal)
+    const result = await ctx.commands.execute(agent, `/stage ${STAGE_SECOND}`, [], new AbortController().signal)
     expect(result?.result).toEqual({
       kind: 'success',
-      text: formatPrompt(stageSwitchPrompts.command.switched, { target: 'implement' }),
+      text: formatPrompt(stageSwitchPrompts.command.switched, { target: STAGE_SECOND }),
     })
     // The idle commit writes the durable notice the fold reads on resume.
-    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
-    expect(stageNoticeSummaries(agent.session)).toEqual(['Current stage: implement'])
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_SECOND)
+    expect(stageNoticeSummaries(agent.session)).toEqual([`Current stage: ${STAGE_SECOND}`])
   })
 
   it('renders the review dialog in Chinese when the row config declares language: zh', { timeout: 60_000 }, async () => {
@@ -334,18 +334,18 @@ describe('real Loader composition through cordis.yml', () => {
       return Promise.resolve({ answers: [{ id: 'stage-review', selected: [ZH.review.approveLabel] }] })
     })
     openTurn(agent.session)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# 交接' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# 交接' })
     expect(result.isError).toBe(false)
     expect(asked).toHaveLength(1)
     expect(asked[0]?.questions[0]?.header).toBe(ZH.review.header)
     expect(asked[0]?.questions[0]?.question)
-      .toBe(formatPrompt(ZH.review.fullQuestion, { stage: 'implement' }))
+      .toBe(formatPrompt(ZH.review.fullQuestion, { stage: STAGE_SECOND }))
     expect(asked[0]?.questions[0]?.detail).toBe('# 交接')
     expect(asked[0]?.questions[0]?.options?.map(option => option.label))
       .toEqual([ZH.review.approveLabel, ZH.review.keepStageLabel])
     // The switch still lands: the boundary flush records the new stage.
     await boundary(ctx, agent, 'step-start')
-    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_SECOND)
   })
 
   it('unloads cleanly: disposing the plugin fiber removes the service, the tool, and the command', { timeout: 60_000 }, async () => {
@@ -369,7 +369,7 @@ describe('real Loader composition through cordis.yml', () => {
     // appended for the session, and the fold stays where the record left it.
     await boundary(ctx, agent, 'step-start')
     expect(stageNoticeSummaries(agent.session)).toHaveLength(1)
-    expect(foldStage(agent.session.snapshotEvents())).toBe('explore')
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_FIRST)
     // The projection registration was effect-scoped on the plugin's fiber:
     // disposal removes the key (capability absence, not a stale read path).
     expect(ctx.sessionProjections.stateOf(agent.session, 'stage')).toBeUndefined()

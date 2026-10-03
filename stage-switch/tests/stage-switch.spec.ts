@@ -19,8 +19,8 @@ import type { StageConfig } from '../src/index.ts'
 import { stageSwitchPrompts, formatPrompt, resolveStageSwitchPrompts } from '../src/prompts.ts'
 import { DEFAULT_STAGE_SWITCH_PROMPTS } from '../src/prompts.defaults.ts'
 import {
-  APPROVE_LABEL, KEEP_LABEL, MemoryFs, STAGE_CONFIG,
-  assembleFor, boundary, openTurn, promptTexts,
+  APPROVE_LABEL, KEEP_LABEL, MemoryFs, STAGE_CONFIG, STAGE_FIRST, STAGE_NAMES, STAGE_SECOND, STAGE_THIRD,
+  assembleFor, boundary, openTurn, promptTexts, stageInstruction,
 } from './helpers/shared.ts'
 
 /** Test-only foreign producer: a notice another plugin owns must never fold. */
@@ -162,7 +162,7 @@ describe('resolveConfig', () => {
     const config = {
       ...STAGE_CONFIG,
       handoffDir: 'docs/handoffs',
-      initial: 'implement',
+      initial: STAGE_SECOND,
       minHandoffTokens: 500,
     }
     expect(resolveConfig(config)).toEqual(config)
@@ -179,10 +179,10 @@ describe('resolveConfig', () => {
     expect(() => resolveConfig({
       ...STAGE_CONFIG,
       stages: [
-        { name: 'explore', instruction: 'Explore the problem space and write a plan.' },
-        { name: 'explore', instruction: 'Explore the problem space and write a plan.' },
+        { name: STAGE_FIRST, instruction: stageInstruction(STAGE_FIRST) },
+        { name: STAGE_FIRST, instruction: stageInstruction(STAGE_FIRST) },
       ],
-    })).toThrow('duplicate stage "explore"')
+    })).toThrow(`duplicate stage "${STAGE_FIRST}"`)
   })
 
   it('rejects stage names that are unsafe as file names', () => {
@@ -197,7 +197,7 @@ describe('resolveConfig', () => {
   it('rejects an empty stage instruction', () => {
     expect(() => resolveConfig({
       ...STAGE_CONFIG,
-      stages: [{ name: 'explore', instruction: '  ' }],
+      stages: [{ name: STAGE_FIRST, instruction: '  ' }],
     })).toThrow('non-empty string `instruction`')
   })
 
@@ -238,9 +238,9 @@ describe('foldStage', () => {
 
   it('honors the end prefix', () => {
     const session = Session.create(SessionId('prefix'))
-    appendStageNotice(session, 'Current stage: explore')
-    appendStageNotice(session, 'Current stage: implement')
-    expect(foldStage(session.snapshotEvents(), 1)).toBe('explore')
+    appendStageNotice(session, `Current stage: ${STAGE_FIRST}`)
+    appendStageNotice(session, `Current stage: ${STAGE_SECOND}`)
+    expect(foldStage(session.snapshotEvents(), 1)).toBe(STAGE_FIRST)
   })
 
   /** One stage-switch notice message as every stage entry appends. */
@@ -253,25 +253,25 @@ describe('foldStage', () => {
 
   it('folds from the stage-switch notice summaries', () => {
     const session = Session.create(SessionId('notice-fold'))
-    appendStageNotice(session, 'Current stage: explore')
-    appendStageNotice(session, 'Current stage: implement')
-    expect(foldStage(session.snapshotEvents())).toBe('implement')
+    appendStageNotice(session, `Current stage: ${STAGE_FIRST}`)
+    appendStageNotice(session, `Current stage: ${STAGE_SECOND}`)
+    expect(foldStage(session.snapshotEvents())).toBe(STAGE_SECOND)
   })
 
   it('folds records the V3→V4 migration rewrote to plugin:stage-switch', () => {
     const session = Session.create(SessionId('migrated-fold'))
     session.append('user/message', createUserMessage({
-      content: [{ type: 'text', text: 'Current stage: verify' }],
-      source: { kind: 'plugin:stage-switch', form: 'notice', summary: 'Current stage: verify' },
+      content: [{ type: 'text', text: `Current stage: ${STAGE_THIRD}` }],
+      source: { kind: 'plugin:stage-switch', form: 'notice', summary: `Current stage: ${STAGE_THIRD}` },
     }), { surfaceOp: 'append' })
-    expect(foldStage(session.snapshotEvents())).toBe('verify')
+    expect(foldStage(session.snapshotEvents())).toBe(STAGE_THIRD)
   })
 
   it('folds from the handoff notice summary', () => {
     const session = Session.create(SessionId('handoff-fold'))
-    appendStageNotice(session, 'Current stage: explore')
-    appendStageNotice(session, 'Stage switched to verify')
-    expect(foldStage(session.snapshotEvents())).toBe('verify')
+    appendStageNotice(session, `Current stage: ${STAGE_FIRST}`)
+    appendStageNotice(session, `Stage switched to ${STAGE_THIRD}`)
+    expect(foldStage(session.snapshotEvents())).toBe(STAGE_THIRD)
   })
 
   it('ignores foreign plugin notices, plain user messages, and malformed summaries', () => {
@@ -323,12 +323,12 @@ describe('stage prompt messages', () => {
       header: { config: { provider: 'test', model: 'test-model' } },
       reason: 'initial',
     })
-    expect(ctx.stage.set(agent, 'implement')).toBe('queued')
+    expect(ctx.stage.set(agent, STAGE_SECOND)).toBe('queued')
     await boundary(ctx, agent, 'step-start')
     const texts = promptTexts(agent)
     expect(texts).toContain(
-      formatPrompt(stageSwitchPrompts.notice.userSwitchPrefix, { stage: 'implement' })
-      + 'Current stage: implement\nImplement the approved plan.',
+      formatPrompt(stageSwitchPrompts.notice.userSwitchPrefix, { stage: STAGE_SECOND })
+      + `Current stage: ${STAGE_SECOND}\n${stageInstruction(STAGE_SECOND)}`,
     )
   })
 
@@ -372,7 +372,7 @@ describe('stage prompt messages', () => {
     const agent = await agentWithSession(ctx, 'top-level')
     await boundary(ctx, agent, 'pre-step')
     const stagePrompts = promptTexts(agent).filter(text => text.startsWith('Current stage:'))
-    expect(stagePrompts).toEqual(['Current stage: explore\nExplore the problem space and write a plan.'])
+    expect(stagePrompts).toEqual([`Current stage: ${STAGE_FIRST}\n${stageInstruction(STAGE_FIRST)}`])
   })
 
   it('stage:policy contributes empty text without an eligibility predicate', async () => {
@@ -426,8 +426,8 @@ describe('stage prompt messages', () => {
     const ctx = await setup()
     const agent = await agentWithSession(ctx, 'variables')
     const assembly = await assembleFor(ctx, agent)
-    expect(assembly.variables['stage_current']).toBe('explore')
-    expect(assembly.variables['stage_targets']).toBe('implement, verify')
+    expect(assembly.variables['stage_current']).toBe(STAGE_FIRST)
+    expect(assembly.variables['stage_targets']).toBe(STAGE_NAMES.slice(1).join(', '))
   })
 })
 
@@ -463,20 +463,20 @@ describe('goto_stage validation', () => {
     await ctx.plugin(MemoryFs)
     openTurn(agent.session)
     const result = await callStage(ctx, GOTO_STAGE, agent, {
-      stage: 'implement',
+      stage: STAGE_SECOND,
       handoff: '# Handoff',
     })
     expect(result.isError).toBe(false)
     expect(asked).toHaveLength(1)
     expect(asked[0]?.questions[0]?.header).toBe(zh.review.header)
     // No threshold configured, so the review is the full-transition question.
-    expect(asked[0]?.questions[0]?.question).toBe(formatPrompt(zh.review.fullQuestion, { stage: 'implement' }))
+    expect(asked[0]?.questions[0]?.question).toBe(formatPrompt(zh.review.fullQuestion, { stage: STAGE_SECOND }))
     expect(asked[0]?.questions[0]?.options?.map(option => option.label))
       .toEqual([zh.review.approveLabel, zh.review.keepStageLabel])
   })
   it('rejects an agent-less call', async () => {
     const ctx = await setup()
-    const result = await callStage(ctx, GOTO_STAGE, undefined, { stage: 'implement', handoff: '# Handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, undefined, { stage: STAGE_SECOND, handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([{ type: 'text', text: 'Error: goto_stage requires a calling agent (no session to switch)' }])
   })
@@ -486,15 +486,15 @@ describe('goto_stage validation', () => {
     const agent = await agentWithSession(ctx)
     const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'ghost', handoff: '# Handoff' })
     expect(result.isError).toBe(true)
-    expect(result.content).toEqual([{ type: 'text', text: toolError(formatPrompt(stageSwitchPrompts.errors.notConfigured, { stage: 'ghost', stages: 'explore, implement, verify' })) }])
+    expect(result.content).toEqual([{ type: 'text', text: toolError(formatPrompt(stageSwitchPrompts.errors.notConfigured, { stage: 'ghost', stages: STAGE_NAMES.join(', ') })) }])
   })
 
   it('rejects switching to the current stage', async () => {
     const ctx = await setup()
     const agent = await agentWithSession(ctx)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'explore', handoff: '# Handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_FIRST, handoff: '# Handoff' })
     expect(result.isError).toBe(true)
-    expect(result.content).toEqual([{ type: 'text', text: toolError(formatPrompt(stageSwitchPrompts.errors.alreadyCurrent, { stage: 'explore' })) }])
+    expect(result.content).toEqual([{ type: 'text', text: toolError(formatPrompt(stageSwitchPrompts.errors.alreadyCurrent, { stage: STAGE_FIRST })) }])
   })
 
   it('rejects a missing handoff in the full transition before asking the reviewer', async () => {
@@ -504,7 +504,7 @@ describe('goto_stage validation', () => {
     const ask = vi.fn()
     ctx.on('user-questions/request', ask as never)
     const agent = await agentWithSession(ctx)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND })
     expect(result.isError).toBe(true)
     // The rejection is the progressive-disclosure point for the full-switch
     // guidance: it carries exactly the configured handoff template.
@@ -516,7 +516,7 @@ describe('goto_stage validation', () => {
   it('degrades to the manual switch when no user-questions seam is composed', async () => {
     const ctx = await setup()
     const agent = await agentWithSession(ctx)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([{ type: 'text', text: toolError(stageSwitchPrompts.errors.noUserQuestions) }])
   })
@@ -527,7 +527,7 @@ describe('goto_stage validation', () => {
     await ctx.plugin(UserQuestionService)
     ctx.on('user-questions/request', vi.fn() as never)
     const agent = await agentWithSession(ctx)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([{ type: 'text', text: toolError(stageSwitchPrompts.errors.noFs) }])
   })
@@ -544,7 +544,7 @@ describe('goto_stage validation', () => {
     await ctx.plugin(FailingFs)
     ctx.on('user-questions/request', vi.fn() as never)
     const agent = await agentWithSession(ctx)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([{ type: 'text', text: 'Error: disk full' }])
     expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
@@ -569,7 +569,7 @@ describe('goto_stage presentationMeta (full-transition marker)', () => {
     await ctx.plugin(MemoryFs)
     openTurn(agent.session)
     const result = await callStage(ctx, GOTO_STAGE, agent, {
-      stage: 'implement',
+      stage: STAGE_SECOND,
       handoff: '# Implement\n\n- Completed: exploration',
     })
     expect(result.isError).toBe(false)
@@ -601,7 +601,7 @@ describe('goto_stage presentationMeta (full-transition marker)', () => {
       content: [{ type: 'text', text: 'short' }],
       source: { kind: 'user' },
     }), { surfaceOp: 'append' })
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND })
     expect(result.isError).toBe(false)
     if (result.isError) throw new Error('expected light transition')
     expect((result as { value: { handoffPath?: string } }).value.handoffPath).toBeUndefined()
@@ -611,7 +611,7 @@ describe('goto_stage presentationMeta (full-transition marker)', () => {
   it('stamps no marker on a rejected review (isError, no meta)', async () => {
     const { ctx, agent } = await setupWithReview(undefined, { selected: [KEEP_LABEL] }).run()
     await ctx.plugin(MemoryFs)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     // Error results bypass createSuccessResult, so presentationMeta never runs
     // and the result carries no meta at all — a rejected review cannot demote.
@@ -627,7 +627,7 @@ describe('goto_stage presentationMeta (full-transition marker)', () => {
     ctx.on('user-questions/request', () =>
       Promise.reject(new UserQuestionError('cancelled', 'ASK_CANCELLED')))
     const agent = await agentWithSession(ctx, 'dismissed-meta', { cwd: '/workspace' })
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     expect('meta' in result).toBe(false)
     expect((result as { meta?: unknown }).meta).toBeUndefined()
@@ -642,7 +642,7 @@ describe('goto_stage full transition', () => {
     const { ctx, agent, asked } = await setupWithReview(undefined, { selected: [APPROVE_LABEL] }).run()
     await ctx.plugin(MemoryFs)
     openTurn(agent.session)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Implement\n\n- Completed: exploration' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Implement\n\n- Completed: exploration' })
     // Load-bearing guard: a failed call never asks the review, which would
     // make the assertion below vacuous.
     expect(result.isError).toBe(false)
@@ -656,7 +656,7 @@ describe('goto_stage full transition', () => {
     const { ctx, agent } = await setupWithReview(undefined, { selected: [APPROVE_LABEL] }).run()
     await ctx.plugin(MemoryFs)
     openTurn(agent.session)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Implement\n\n- Completed: exploration' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Implement\n\n- Completed: exploration' })
     // Load-bearing guard: a failed call also leaves the surface empty, which
     // would make the assertion below vacuous.
     expect(result.isError).toBe(false)
@@ -677,14 +677,14 @@ describe('goto_stage full transition', () => {
     const second = await agentWithSession(ctx, 'session-bbb', { cwd: '/workspace' })
     openTurn(first.session)
     openTurn(second.session)
-    const firstResult = await callStage(ctx, GOTO_STAGE, first, { stage: 'implement', handoff: '# First' })
-    const secondResult = await callStage(ctx, GOTO_STAGE, second, { stage: 'implement', handoff: '# Second' })
+    const firstResult = await callStage(ctx, GOTO_STAGE, first, { stage: STAGE_SECOND, handoff: '# First' })
+    const secondResult = await callStage(ctx, GOTO_STAGE, second, { stage: STAGE_SECOND, handoff: '# Second' })
     expect(firstResult.isError).toBe(false)
     expect(secondResult.isError).toBe(false)
     const fs = ctx.get('fs') as MemoryFs
     expect(fs.writes).toEqual([
-      { path: '/workspace/handoff/session-aaa/implement.md', content: '# First' },
-      { path: '/workspace/handoff/session-bbb/implement.md', content: '# Second' },
+      { path: `/workspace/handoff/session-aaa/${STAGE_SECOND}.md`, content: '# First' },
+      { path: `/workspace/handoff/session-bbb/${STAGE_SECOND}.md`, content: '# Second' },
     ])
   })
 
@@ -698,10 +698,10 @@ describe('goto_stage full transition', () => {
     }))
     const agent = await agentWithSession(ctx, 'odd id/../x', { cwd: '/workspace' })
     openTurn(agent.session)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Odd' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Odd' })
     expect(result.isError).toBe(false)
     const fs = ctx.get('fs') as MemoryFs
-    expect(fs.writes).toEqual([{ path: '/workspace/handoff/odd-id-..-x/implement.md', content: '# Odd' }])
+    expect(fs.writes).toEqual([{ path: `/workspace/handoff/odd-id-..-x/${STAGE_SECOND}.md`, content: '# Odd' }])
   })
 
   it('stamps the handoff write with the session sandbox policy, not the deployment fallback', async () => {
@@ -711,7 +711,7 @@ describe('goto_stage full transition', () => {
     MemorySandboxPolicy.requests.length = 0
     openTurn(agent.session)
     const result = await callStage(ctx, GOTO_STAGE, agent, {
-      stage: 'implement',
+      stage: STAGE_SECOND,
       handoff: '# Implement\n\n- Completed: exploration\n- Requirements: policy probe',
     })
     expect(result.isError).toBe(false)
@@ -737,14 +737,14 @@ describe('goto_stage full transition', () => {
       content: [{ type: 'text', text: 'more old work' }],
       source: { kind: 'user' },
     }), { surfaceOp: 'append' })
-    await callStage(ctx, GOTO_STAGE, agent, { stage: 'verify', handoff: '# Verify\n\ncheck it' })
+    await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_THIRD, handoff: '# Verify\n\ncheck it' })
     expect(agent.session.deriveMessages()).toHaveLength(2)
     await boundary(ctx, agent, 'step-start')
     const texts = promptTexts(agent)
     expect(texts).toHaveLength(2)
     expect(texts[0]).toContain(formatPrompt(stageSwitchPrompts.notice.handoffReplaced, {
-      stage: 'verify',
-      path: '/workspace/handoff/agent-1/verify.md',
+      stage: STAGE_THIRD,
+      path: `/workspace/handoff/agent-1/${STAGE_THIRD}.md`,
     }))
     expect(texts[1]).toBe('boundary probe')
     // The durable log retains the archived history for the human transcript.
@@ -759,7 +759,7 @@ describe('goto_stage full transition', () => {
     await ctx.plugin(MemoryFs)
     openTurn(agent.session)
     const result = await callStage(ctx, GOTO_STAGE, agent, {
-      stage: 'implement',
+      stage: STAGE_SECOND,
       handoff: '# Implement\n\n- Completed: exploration',
     })
     expect(result.isError).toBe(false)
@@ -767,13 +767,13 @@ describe('goto_stage full transition', () => {
     await boundary(ctx, agent, 'step-start')
     // The boundary flush writes the handoff notice (summary `Stage switched to
     // <stage>`): the fold restores the stage for resume/fork from the notice alone.
-    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_SECOND)
   })
 
   it('the review answer must be exactly one Approve without custom text', async () => {
     const { ctx, agent } = await setupWithReview(undefined, { selected: [KEEP_LABEL], custom: 'revisit the handoff' }).run()
     await ctx.plugin(MemoryFs)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([{ type: 'text', text: toolError(formatPrompt(stageSwitchPrompts.errors.keepPlanningFeedback, { feedback: 'revisit the handoff' })) }])
     expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
@@ -788,7 +788,7 @@ describe('goto_stage full transition', () => {
       Promise.reject(new UserQuestionError(
         'the user cancelled ask_user_question', 'ASK_CANCELLED')))
     const agent = await agentWithSession(ctx)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([{ type: 'text', text: toolError(stageSwitchPrompts.errors.dismissed) }])
     expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
@@ -806,7 +806,7 @@ describe('goto_stage full transition', () => {
     let answer!: (value: { answers: { id: string; selected: string[] }[] }) => void
     ctx.on('user-questions/request', () => new Promise((resolve) => { answer = resolve }))
     const agent = await agentWithSession(ctx)
-    const pending = callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    const pending = callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff' })
     await new Promise(resolve => setImmediate(resolve))
     await fiber.dispose()
     answer({ answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }] })
@@ -843,17 +843,17 @@ describe('goto_stage token-threshold transitions', () => {
       content: [{ type: 'text', text: 'long conversation '.repeat(60) }],
       source: { kind: 'user' },
     }), { surfaceOp: 'append' })
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff\n\nhandoff text' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff\n\nhandoff text' })
     expect(result.isError).toBe(false)
     if (result.isError) throw new Error('expected approved transition')
-    expect((result.value as { handoffPath: string }).handoffPath).toBe('/workspace/handoff/agent-1/implement.md')
+    expect((result.value as { handoffPath: string }).handoffPath).toBe(`/workspace/handoff/agent-1/${STAGE_SECOND}.md`)
     // The full review carried the handoff detail (the standalone build omits
     // the stage-review presentation intent; see the boundary test above).
     expect(asked[0]?.questions[0]?.detail).toBe('# Handoff\n\nhandoff text')
     await boundary(ctx, agent, 'step-start')
     expect(promptTexts(agent)[0]).toContain(formatPrompt(stageSwitchPrompts.notice.handoffReplaced, {
-      stage: 'implement',
-      path: '/workspace/handoff/agent-1/implement.md',
+      stage: STAGE_SECOND,
+      path: `/workspace/handoff/agent-1/${STAGE_SECOND}.md`,
     }))
   })
 
@@ -864,10 +864,10 @@ describe('goto_stage token-threshold transitions', () => {
       content: [{ type: 'text', text: 'short' }],
       source: { kind: 'user' },
     }), { surfaceOp: 'append' })
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND })
     expect(result.isError).toBe(false)
     if (result.isError) throw new Error('expected approved transition')
-    expect(result.value).toEqual({ approved: true, stage: 'implement' })
+    expect(result.value).toEqual({ approved: true, stage: STAGE_SECOND })
     // No handoff was written and the review stayed generic (no intent/detail).
     const fs = ctx.get('fs') as MemoryFs
     expect(fs.writes).toEqual([])
@@ -875,7 +875,7 @@ describe('goto_stage token-threshold transitions', () => {
     expect(asked[0]?.questions[0]?.detail).toBeUndefined()
     await boundary(ctx, agent, 'step-start')
     // Stage switched; the conversation history is retained.
-    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_SECOND)
     const texts = promptTexts(agent)
     expect(texts[0]).toBe('short')
     expect(texts.at(-1)).toBe('boundary probe')
@@ -892,18 +892,18 @@ describe('goto_stage token-threshold transitions', () => {
     }), { surfaceOp: 'append' })
     // First call omits the handoff: rejected with the template, no review
     // asked, nothing written — the model then retries with the document.
-    const rejected = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement' })
+    const rejected = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND })
     expect(rejected.isError).toBe(true)
     expect(rejected.content).toEqual([{ type: 'text', text: toolError(stageSwitchPrompts.errors.requiresHandoff) }])
     const fs = ctx.get('fs') as MemoryFs
     expect(fs.writes).toEqual([])
     expect(asked).toHaveLength(0)
     // Retry with the handoff: approved, written, and reviewed once.
-    const retried = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Implement\n\n- Completed: exploration' })
+    const retried = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Implement\n\n- Completed: exploration' })
     expect(retried.isError).toBe(false)
     if (retried.isError) throw new Error('expected approved retry')
-    expect((retried.value as { handoffPath: string }).handoffPath).toBe('/workspace/handoff/agent-1/implement.md')
-    expect(fs.writes).toEqual([{ path: '/workspace/handoff/agent-1/implement.md', content: '# Implement\n\n- Completed: exploration' }])
+    expect((retried.value as { handoffPath: string }).handoffPath).toBe(`/workspace/handoff/agent-1/${STAGE_SECOND}.md`)
+    expect(fs.writes).toEqual([{ path: `/workspace/handoff/agent-1/${STAGE_SECOND}.md`, content: '# Implement\n\n- Completed: exploration' }])
     expect(asked).toHaveLength(1)
   })
 
@@ -914,10 +914,10 @@ describe('goto_stage token-threshold transitions', () => {
       content: [{ type: 'text', text: 'short' }],
       source: { kind: 'user' },
     }), { surfaceOp: 'append' })
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Unneeded handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Unneeded handoff' })
     expect(result.isError).toBe(false)
     if (result.isError) throw new Error('expected approved transition')
-    expect(result.value).toEqual({ approved: true, stage: 'implement' })
+    expect(result.value).toEqual({ approved: true, stage: STAGE_SECOND })
     const fs = ctx.get('fs') as MemoryFs
     expect(fs.writes).toEqual([])
     expect(asked[0]?.questions[0]?.detail).toBeUndefined()
@@ -929,7 +929,7 @@ describe('goto_stage token-threshold transitions', () => {
     await ctx.plugin(UserQuestionService)
     ctx.on('user-questions/request', vi.fn() as never)
     const agent = await agentWithSession(ctx)
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff' })
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([{ type: 'text', text: toolError(stageSwitchPrompts.errors.missingTokenMeter) }])
   })
@@ -939,17 +939,17 @@ describe('goto_stage presentation', () => {
   it('presents the call as a generic card titled by the target stage', async () => {
     const ctx = await setup()
     const def = ctx.tools.get(GOTO_STAGE)!
-    expect(def.presentCall?.({ stage: 'implement', handoff: '# Handoff\n\nwork' })).toEqual({
+    expect(def.presentCall?.({ stage: STAGE_SECOND, handoff: '# Handoff\n\nwork' })).toEqual({
       card: 'generic',
-      title: formatPrompt(stageSwitchPrompts.present.callTitle, { stage: 'implement' }),
+      title: formatPrompt(stageSwitchPrompts.present.callTitle, { stage: STAGE_SECOND }),
       kind: 'other',
       content: [{ type: 'text', text: '# Handoff\n\nwork' }],
     })
-    expect(def.presentCall?.({ stage: 'implement' })).toEqual({
+    expect(def.presentCall?.({ stage: STAGE_SECOND })).toEqual({
       card: 'generic',
-      title: formatPrompt(stageSwitchPrompts.present.callTitle, { stage: 'implement' }),
+      title: formatPrompt(stageSwitchPrompts.present.callTitle, { stage: STAGE_SECOND }),
       kind: 'other',
-      content: [{ type: 'text', text: formatPrompt(stageSwitchPrompts.present.lightCallContent, { stage: 'implement' }) }],
+      content: [{ type: 'text', text: formatPrompt(stageSwitchPrompts.present.lightCallContent, { stage: STAGE_SECOND }) }],
     })
   })
 
@@ -957,7 +957,7 @@ describe('goto_stage presentation', () => {
     const ctx = await setup()
     const def = ctx.tools.get(GOTO_STAGE)!
     const content = [{ type: 'text' as const, text: 'ok' }]
-    expect(def.presentResult?.({ stage: 'implement' }, { content, isError: false })).toEqual({
+    expect(def.presentResult?.({ stage: STAGE_SECOND }, { content, isError: false })).toEqual({
       card: 'generic',
       title: stageSwitchPrompts.present.resultTitle,
       content,
@@ -985,33 +985,33 @@ describe('stage command', () => {
   it('shows the current stage and the stage list', async () => {
     const { ctx, agent, signal } = await commandSetup()
     agent.session.append('user/message', createUserMessage({
-      content: [{ type: 'text', text: 'Current stage: implement' }],
-      source: { kind: 'stage-switch', form: 'notice', summary: 'Current stage: implement' },
+      content: [{ type: 'text', text: `Current stage: ${STAGE_SECOND}` }],
+      source: { kind: 'stage-switch', form: 'notice', summary: `Current stage: ${STAGE_SECOND}` },
     }), { surfaceOp: 'append' })
     const result = await runCommand(ctx, agent, '/stage', signal)
     expect(result?.result).toEqual({
       kind: 'success',
-      text: formatPrompt(stageSwitchPrompts.command.current, { stage: 'implement', stages: 'explore, implement, verify' }),
+      text: formatPrompt(stageSwitchPrompts.command.current, { stage: STAGE_SECOND, stages: STAGE_NAMES.join(', ') }),
     })
-    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_SECOND)
   })
 
   it('commits the notice summary as the record', async () => {
     const { ctx, agent, signal } = await commandSetup()
-    await runCommand(ctx, agent, '/stage implement', signal)
+    await runCommand(ctx, agent, `/stage ${STAGE_SECOND}`, signal)
     const notices = agent.session.snapshotEvents()
       .filter(event => event.type === 'user/message')
       .map(event => event.data.source)
       .filter(source => source.kind === 'stage-switch')
     expect(notices).toEqual([
-      expect.objectContaining({ form: 'notice', summary: 'Current stage: implement' }),
+      expect.objectContaining({ form: 'notice', summary: `Current stage: ${STAGE_SECOND}` }),
     ])
   })
 
   it('switching to the current stage is a no-op', async () => {
     const { ctx, agent, signal } = await commandSetup()
-    expect((await runCommand(ctx, agent, '/stage explore', signal))?.result)
-      .toEqual({ kind: 'success', text: formatPrompt(stageSwitchPrompts.command.alreadyCurrent, { target: 'explore' }) })
+    expect((await runCommand(ctx, agent, `/stage ${STAGE_FIRST}`, signal))?.result)
+      .toEqual({ kind: 'success', text: formatPrompt(stageSwitchPrompts.command.alreadyCurrent, { target: STAGE_FIRST }) })
     expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
   })
 
@@ -1020,7 +1020,7 @@ describe('stage command', () => {
     const result = await runCommand(ctx, agent, '/stage ghost', signal)
     expect(result?.result).toEqual({
       kind: 'error',
-      text: formatPrompt(stageSwitchPrompts.command.unknown, { target: 'ghost', stages: 'explore, implement, verify' }),
+      text: formatPrompt(stageSwitchPrompts.command.unknown, { target: 'ghost', stages: STAGE_NAMES.join(', ') }),
     })
     expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
   })
@@ -1032,19 +1032,19 @@ describe('stage command', () => {
       header: { config: { provider: 'test', model: 'test-model' } },
       reason: 'initial',
     })
-    expect((await runCommand(ctx, agent, '/stage implement', signal))?.result)
-      .toEqual({ kind: 'success', text: formatPrompt(stageSwitchPrompts.command.queued, { target: 'implement' }) })
+    expect((await runCommand(ctx, agent, `/stage ${STAGE_SECOND}`, signal))?.result)
+      .toEqual({ kind: 'success', text: formatPrompt(stageSwitchPrompts.command.queued, { target: STAGE_SECOND }) })
     expect(foldStage(agent.session.snapshotEvents())).toBeUndefined()
     await boundary(ctx, agent, 'step-start')
-    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_SECOND)
     // The boundary appended the stage prompt with the user-switch notice
     // because the last header described the other stage.
     const notices = agent.session.snapshotEvents()
       .filter(event => event.type === 'user/message' && event.data.source.kind === 'stage-switch')
       .map(event => (event.data as { content: { type: string; text?: string }[] }).content.map(block => block.text ?? '').join(''))
     expect(notices).toEqual([
-      formatPrompt(stageSwitchPrompts.notice.userSwitchPrefix, { stage: 'implement' })
-      + 'Current stage: implement\nImplement the approved plan.',
+      formatPrompt(stageSwitchPrompts.notice.userSwitchPrefix, { stage: STAGE_SECOND })
+      + `Current stage: ${STAGE_SECOND}\n${stageInstruction(STAGE_SECOND)}`,
     ])
   })
 
@@ -1063,26 +1063,26 @@ describe('stage command', () => {
       header: { config: { provider: 'test', model: 'test-model' } },
       reason: 'initial',
     })
-    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# Handoff' })
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: STAGE_SECOND, handoff: '# Handoff' })
     expect(result.isError).toBe(false)
     await boundary(ctx, agent, 'step-start')
-    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_SECOND)
     // Only the handoff notice exists; no user-switch narration was injected
     // because the tool result already narrates the transition.
     const texts = agent.session.snapshotEvents()
       .filter(event => event.type === 'user/message' && event.data.source.kind === 'stage-switch')
       .map(event => (event.data as { content: { type: string; text?: string }[] }).content.map(block => block.text ?? '').join(''))
-    expect(texts.some(text => text.includes(formatPrompt(stageSwitchPrompts.notice.userSwitchPrefix, { stage: 'implement' })))).toBe(false)
+    expect(texts.some(text => text.includes(formatPrompt(stageSwitchPrompts.notice.userSwitchPrefix, { stage: STAGE_SECOND })))).toBe(false)
     expect(texts.some(text => text.includes(formatPrompt(stageSwitchPrompts.notice.handoffReplaced, {
-      stage: 'implement',
-      path: '/workspace/handoff/command-tool-narrate/implement.md',
+      stage: STAGE_SECOND,
+      path: `/workspace/handoff/command-tool-narrate/${STAGE_SECOND}.md`,
     })))).toBe(true)
   })
 
   it('steers a trailing message into the switched stage context', async () => {
     const { ctx, agent, signal, steer } = await commandSetup()
-    expect((await runCommand(ctx, agent, '/stage implement focus on the resume path', signal))?.result)
-      .toEqual({ kind: 'success', text: formatPrompt(stageSwitchPrompts.command.switched, { target: 'implement' }) })
+    expect((await runCommand(ctx, agent, `/stage ${STAGE_SECOND} focus on the resume path`, signal))?.result)
+      .toEqual({ kind: 'success', text: formatPrompt(stageSwitchPrompts.command.switched, { target: STAGE_SECOND }) })
     expect(steer).toHaveBeenCalledWith(expect.objectContaining({
       content: [{ type: 'text', text: 'focus on the resume path' }],
       source: { kind: 'user' },
@@ -1091,8 +1091,8 @@ describe('stage command', () => {
 
   it('steers a trailing message even when the target is already current', async () => {
     const { ctx, agent, signal, steer } = await commandSetup()
-    expect((await runCommand(ctx, agent, '/stage explore keep exploring', signal))?.result)
-      .toEqual({ kind: 'success', text: formatPrompt(stageSwitchPrompts.command.alreadyCurrent, { target: 'explore' }) })
+    expect((await runCommand(ctx, agent, `/stage ${STAGE_FIRST} keep exploring`, signal))?.result)
+      .toEqual({ kind: 'success', text: formatPrompt(stageSwitchPrompts.command.alreadyCurrent, { target: STAGE_FIRST }) })
     expect(steer).toHaveBeenCalledWith(expect.objectContaining({
       content: [{ type: 'text', text: 'keep exploring' }],
       source: { kind: 'user' },
