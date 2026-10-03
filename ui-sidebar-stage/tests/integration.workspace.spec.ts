@@ -16,6 +16,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
+import { STAGE_NAMES } from './helpers.ts'
 import own from '../package.json' with { type: 'json' }
 import { HARNESS_ROOT as HARNESS } from './workspace-root.ts'
 const active = process.env.DSH_WORKSPACE_INTEGRATION === '1' && existsSync(`${HARNESS}/tsconfig.base.json`)
@@ -42,6 +43,7 @@ describe.skipIf(!active)('workspace integration over the dsh source checkout', (
     const { SlotTestRuntime } = await import('@deepseek-ai/dsh-client-test-runtime')
     const { LocaleRuntime } = await import('@deepseek-ai/dsh-client-locale/client')
     const { STAGE_ID } = await import('../src/client/definition.tsx')
+    const { en } = await import('../src/client/locales.ts')
     const { apply, inject } = await import('../src/client/index.tsx')
     type SessionEventLikeEntry = import('@deepseek-ai/dsh-api-session-controller/client').SessionEventLikeEntry
 
@@ -79,18 +81,18 @@ describe.skipIf(!active)('workspace integration over the dsh source checkout', (
       const reference = runtime.sessions.retain(sessionId)
       await reference.ready
       await runtime.sessions.replaceEvents(sessionId, [
-        stageEntry(1, 'Current stage: route'),
-        stageEntry(2, 'Stage switched to design'),
+        stageEntry(1, `Current stage: ${STAGE_NAMES.first}`),
+        stageEntry(2, `Stage switched to ${STAGE_NAMES.second}`),
       ])
 
       const view = runtime.renderSlot('sidebar.right.pane.tab', {}, { session: reference, entryKey: STAGE_ID })
-      expect(view.container.querySelector('[data-stage-current]')?.textContent).toBe('design')
+      expect(view.container.querySelector('[data-stage-current]')?.textContent).toBe(STAGE_NAMES.second)
       expect([...view.container.querySelectorAll('[data-stage-history] li')].map(item => item.textContent))
-        .toEqual(['Entered route', 'Switched to design'])
+        .toEqual([`${en.entered} ${STAGE_NAMES.first}`, `${en.switched} ${STAGE_NAMES.second}`])
 
       // Live update: a new stage record re-renders the body.
-      await runtime.sessions.appendEvent(sessionId, stageEntry(3, 'Stage switched to content'))
-      expect(view.container.querySelector('[data-stage-current]')?.textContent).toBe('content')
+      await runtime.sessions.appendEvent(sessionId, stageEntry(3, `Stage switched to ${STAGE_NAMES.third}`))
+      expect(view.container.querySelector('[data-stage-current]')?.textContent).toBe(STAGE_NAMES.third)
 
       await handle.dispose()
     } finally {

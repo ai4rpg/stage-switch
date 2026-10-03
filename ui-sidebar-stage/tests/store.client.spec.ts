@@ -4,6 +4,7 @@
  * detaches (and resets) on the last unsubscribe.
  */
 import { describe, expect, it, vi } from 'vitest'
+import { STAGE_NAMES } from './helpers.ts'
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import type { SessionEventLikeEntry, SessionEventWindow } from '@deepseek-ai/dsh-api-session-controller/client'
 import { createStageSource } from '../src/client/store.ts'
@@ -39,7 +40,7 @@ function stageNotice(seq: number, summary: string): SessionEvent {
 describe('createStageSource', () => {
   it('folds the window on attach and follows every mutation', () => {
     const window = new FakeWindow()
-    window.push(stageNotice(1, 'Current stage: route'))
+    window.push(stageNotice(1, `Current stage: ${STAGE_NAMES.first}`))
     const binding = vi.fn(() => ({ sessionId: 's-1', eventSource: window.eventSource }))
     const source = createStageSource({ binding } as never, 's-1' as never)
 
@@ -47,34 +48,34 @@ describe('createStageSource', () => {
     const listener = vi.fn()
     const unsubscribe = source.subscribe(listener)
 
-    expect(source.getSnapshot().current).toBe('route')
+    expect(source.getSnapshot().current).toBe(STAGE_NAMES.first)
     expect(source.getSnapshot().records).toHaveLength(1)
     expect(binding).toHaveBeenCalledTimes(1)
 
-    window.push(stageNotice(2, 'Stage switched to design'))
+    window.push(stageNotice(2, `Stage switched to ${STAGE_NAMES.second}`))
     expect(listener).toHaveBeenCalledTimes(1)
-    expect(source.getSnapshot().current).toBe('design')
+    expect(source.getSnapshot().current).toBe(STAGE_NAMES.second)
     expect(source.getSnapshot().records.map(record => [record.stage, record.switched])).toEqual([
-      ['route', false],
-      ['design', true],
+      [STAGE_NAMES.first, false],
+      [STAGE_NAMES.second, true],
     ])
     unsubscribe()
   })
 
   it('detaches on the last unsubscribe and reattaches fresh on the next', () => {
     const window = new FakeWindow()
-    window.push(stageNotice(1, 'Current stage: route'))
+    window.push(stageNotice(1, `Current stage: ${STAGE_NAMES.first}`))
     const source = createStageSource({ binding: () => ({ eventSource: window.eventSource }) } as never, 's-1' as never)
 
     const unsubscribe = source.subscribe(() => {})
-    expect(source.getSnapshot().current).toBe('route')
+    expect(source.getSnapshot().current).toBe(STAGE_NAMES.first)
     unsubscribe()
     expect(source.getSnapshot().records).toEqual([])
 
-    window.push(stageNotice(2, 'Stage switched to design'))
+    window.push(stageNotice(2, `Stage switched to ${STAGE_NAMES.second}`))
     const unsubscribeAgain = source.subscribe(() => {})
     expect(source.getSnapshot().records).toHaveLength(2)
-    expect(source.getSnapshot().current).toBe('design')
+    expect(source.getSnapshot().current).toBe(STAGE_NAMES.second)
     unsubscribeAgain()
   })
 
@@ -87,9 +88,9 @@ describe('createStageSource', () => {
     unsubscribe()
 
     window = new FakeWindow()
-    window.push(stageNotice(1, 'Current stage: content'))
+    window.push(stageNotice(1, `Current stage: ${STAGE_NAMES.third}`))
     const unsubscribeAgain = source.subscribe(() => {})
-    expect(source.getSnapshot().current).toBe('content')
+    expect(source.getSnapshot().current).toBe(STAGE_NAMES.third)
     unsubscribeAgain()
   })
 })

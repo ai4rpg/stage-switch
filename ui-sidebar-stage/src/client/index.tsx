@@ -4,7 +4,9 @@
  * The public two-stage path, unmodified: the type into `ctx.sidebarRightTabs`,
  * the body into the keyed `sidebar.right.pane.tab` seat under the type's id.
  * The per-session inject face carries one `hooks` compartment — `stage` —
- * which the slot runtime renders as the body's `useStage` selector prop.
+ * which the slot runtime renders as the body's `useStage` selector prop, plus
+ * the `switchStage` action that submits `/stage <name>` through the session's
+ * command face (everything outside `hooks` passes through as a plain prop).
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
@@ -16,11 +18,13 @@ import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import { STAGE_ID, stageDefinition } from './definition.tsx'
 import { StageBody } from './StageBody.tsx'
 import { createStageSource } from './store.ts'
+import { createStageSwitcher } from './switch.ts'
 import { en, NS, zh } from './locales.ts'
 
 export type { StageRecord } from './fold.ts'
 export type { StageView } from './store.ts'
 export type { StageBodyProps } from './StageBody.tsx'
+export type { StageSwitchOutcome } from './switch.ts'
 
 /** Required browser services: the tab registry, the slots seat, the session bindings, and copy. */
 export const inject = ['slots', 'locale', 'sidebarRightTabs', 'sessions']
@@ -39,7 +43,10 @@ export function apply(ctx: ClientContext): void {
       name: 'sidebar.right.pane.tab',
       key: STAGE_ID,
       locale: NS,
-      inject: (sessionId: SessionId) => ({ hooks: { stage: createStageSource(sessions, sessionId) } }),
+      inject: (sessionId: SessionId) => ({
+        hooks: { stage: createStageSource(sessions, sessionId) },
+        switchStage: createStageSwitcher(sessions, sessionId),
+      }),
     },
     StageBody,
   )), 'ui-sidebar-stage: stage tab body')

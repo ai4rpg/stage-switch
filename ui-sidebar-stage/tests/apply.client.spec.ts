@@ -16,6 +16,7 @@ import { apply, inject } from '../src/client/index.tsx'
 import { apply as hostApply } from '../src/index.ts'
 import { StageBody } from '../src/client/StageBody.tsx'
 import { en, zh } from '../src/client/locales.ts'
+import { STAGE_NAMES } from './helpers.ts'
 
 interface Recorded {
   name: string
@@ -82,9 +83,12 @@ describe('ui-sidebar-stage apply', () => {
     expect(typeof registered[0]?.inject).toBe('function')
   })
 
-  it('builds the stage view source per session in the inject face', async () => {
+  it('builds the stage view source and the switch action per session in the inject face', async () => {
     const { registered, sessions } = await boot()
-    const injectFace = registered[0]?.inject as (sessionId: string) => { hooks: { stage: unknown } }
+    const injectFace = registered[0]?.inject as (sessionId: string) => {
+      hooks: { stage: unknown }
+      switchStage: (stage: string) => Promise<unknown>
+    }
     sessions.binding.mockReturnValue({ eventSource: { getSnapshot: () => ({ entries: [] }), subscribe: () => () => {} } })
     const face = injectFace('s-1')
     const stage = face.hooks.stage as { getSnapshot: () => { records: unknown[] }, subscribe: (listener: () => void) => () => void }
@@ -94,6 +98,13 @@ describe('ui-sidebar-stage apply', () => {
     expect(sessions.binding).toHaveBeenCalledWith('s-1')
     expect(stage.getSnapshot().records).toEqual([])
     unsubscribe()
+    // The switch action submits `/stage <name>` through the same binding's
+    // command face; the placeholder command mock answers `matched: true`.
+    sessions.binding.mockReturnValue({
+      eventSource: { getSnapshot: () => ({ entries: [] }), subscribe: () => () => {} },
+      session: { command: (line: string) => Promise.resolve({ ok: true, value: { matched: line.startsWith('/stage ') } }) },
+    })
+    await expect(face.switchStage(STAGE_NAMES.target)).resolves.toEqual({ ok: true })
   })
 
   it('takes every registration back when the plugin is disposed', async () => {

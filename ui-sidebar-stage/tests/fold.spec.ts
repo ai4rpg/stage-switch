@@ -25,19 +25,19 @@ function entry(event: SessionEvent<keyof SessionEventMap>): SessionEventLikeEntr
 describe('foldStageRecords', () => {
   it('folds records of both producer kinds with their stage and switch flag', () => {
     const records = foldStageRecords([
-      entry(userMessage(1, { kind: 'stage-switch', form: 'notice', summary: 'Current stage: route' })),
-      entry(userMessage(2, { kind: 'plugin:stage-switch', form: 'notice', summary: 'Stage switched to design' })),
+      entry(userMessage(1, { kind: 'stage-switch', form: 'notice', summary: 'Current stage: stage-a' })),
+      entry(userMessage(2, { kind: 'plugin:stage-switch', form: 'notice', summary: 'Stage switched to stage-b' })),
     ])
     expect(records).toEqual([
-      { stage: 'route', seq: 1, time: 1_700_000_000_001, switched: false },
-      { stage: 'design', seq: 2, time: 1_700_000_000_002, switched: true },
+      { stage: 'stage-a', seq: 1, time: 1_700_000_000_001, switched: false },
+      { stage: 'stage-b', seq: 2, time: 1_700_000_000_002, switched: true },
     ])
   })
 
   it('ignores human messages, other producers, and transient entries', () => {
     const records = foldStageRecords([
       entry(userMessage(1, { kind: 'user' })),
-      entry(userMessage(2, { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary: 'Current stage: route' })),
+      entry(userMessage(2, { kind: 'plugin', plugin: 'stage-switch', form: 'notice', summary: 'Current stage: stage-a' })),
       entry(userMessage(3, { kind: 'compact-checkpoint' })),
       { type: 'transient', event: { type: 'assistant/live-chunk', seq: 4, time: 0, data: {} } } as unknown as SessionEventLikeEntry,
       entry({ type: 'turn/start', seq: 5, time: 0, data: { turn: 1 } } as SessionEvent<'turn/start'>),
@@ -49,7 +49,7 @@ describe('foldStageRecords', () => {
     const records = foldStageRecords([
       entry(userMessage(1, { kind: 'stage-switch', form: 'notice', summary: 'bogus' })),
       entry(userMessage(2, { kind: 'stage-switch', form: 'notice', summary: 'Current stage: Not A Stage!' })),
-      entry(userMessage(3, { kind: 'stage-switch', form: 'prompt', summary: 'Current stage: route' })),
+      entry(userMessage(3, { kind: 'stage-switch', form: 'prompt', summary: 'Current stage: stage-a' })),
       entry(userMessage(4, { kind: 'stage-switch', form: 'notice' })),
     ])
     expect(records).toEqual([])

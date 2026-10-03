@@ -24,6 +24,9 @@ export const zh = {
   history: '切换历史',
   switched: '切换到',
   entered: '进入',
+  switchTo: '切换到…',
+  switchFailed: '切换失败',
+  switchUnavailable: '阶段切换命令不可用',
 } satisfies Record<string, string>
 
 /** English dictionary. */
@@ -36,6 +39,9 @@ export const en: Record<SidebarStageKey, string> = {
   history: 'Transition history',
   switched: 'Switched to',
   entered: 'Entered',
+  switchTo: 'Switch to…',
+  switchFailed: 'Switch failed',
+  switchUnavailable: 'The stage switch command is unavailable',
 }
 
 /** Every key the namespace defines. */
