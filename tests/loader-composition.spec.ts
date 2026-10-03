@@ -43,7 +43,10 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import UserQuestionService, { type AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
 import { assertV4RowAdmission } from '@deepseek-ai/dsh-session-format-v3-to-v4'
 import StageController, { GOTO_STAGE, foldStage } from '../src/index.ts'
-import { stageSwitchPrompts, formatPrompt } from '../src/prompts.ts'
+import { stageSwitchPrompts, formatPrompt, resolveStageSwitchPrompts } from '../src/prompts.ts'
+
+/** The Chinese dictionary the zh composition case expects, derived from the same resolver the service uses. */
+const ZH = resolveStageSwitchPrompts('zh')
 import {
   APPROVE_LABEL, MemoryFs, STAGE_CONFIG, TEST_STAGES,
   assembleFor, boundary, openTurn, promptTexts, stageNoticeSummaries,
@@ -66,7 +69,9 @@ const STAGE_ROWS = TEST_STAGES
   .map(stage => `      - name: ${stage.name}\n        instruction: ${JSON.stringify(stage.instruction)}`)
   .join('\n')
 
-async function loadComposition(): Promise<{ ctx: Context; agent: Agent & { session: Session } }> {
+async function loadComposition(
+  extraStageConfig: readonly string[] = [],
+): Promise<{ ctx: Context; agent: Agent & { session: Session } }> {
   root = await mkdtemp(join(tmpdir(), 'stage-switch-loader-'))
   const configPath = join(root, 'cordis.yml')
   await writeFile(configPath, [
@@ -85,6 +90,7 @@ async function loadComposition(): Promise<{ ctx: Context; agent: Agent & { sessi
     '    stages:',
     STAGE_ROWS,
     `    section: ${JSON.stringify(STAGE_CONFIG.section)}`,
+    ...extraStageConfig,
     '',
   ].join('\n'))
 
@@ -158,6 +164,13 @@ describe('real Loader composition through cordis.yml', () => {
       .toEqual(['Current stage: explore\nExplore the problem space and write a plan.'])
     expect(stageNoticeSummaries(agent.session)).toEqual(['Current stage: explore'])
     expect(foldStage(agent.session.snapshotEvents())).toBe('explore')
+
+    // The read path is the session-projection seam: the service's reads go
+    // through the registered `stage` unit (the harness deprecated the
+    // synchronous whole-log readers), so the composition pins that the unit
+    // is live and carries the folded state the service reads.
+    expect(ctx.sessionProjections.stateOf(agent.session, 'stage'))
+      .toMatchObject({ stage: 'explore', hasStagePrompt: true })
 
     // Model-visible request variables name the folded stage and the targets.
     const assembly = await assembleFor(ctx, agent)
@@ -310,6 +323,31 @@ describe('real Loader composition through cordis.yml', () => {
     expect(stageNoticeSummaries(agent.session)).toEqual(['Current stage: implement'])
   })
 
+  it('renders the review dialog in Chinese when the row config declares language: zh', { timeout: 60_000 }, async () => {
+    // The deployment-declared language route: the composition's row config
+    // picks the zh dictionary at construction — no install-time merge, and
+    // the choice survives reinstalls because it lives in the composition.
+    const { ctx, agent } = await loadComposition(['    language: zh'])
+    const asked: AskUserQuestionRequest[] = []
+    ctx.on('user-questions/request', (request) => {
+      asked.push(request)
+      return Promise.resolve({ answers: [{ id: 'stage-review', selected: [ZH.review.approveLabel] }] })
+    })
+    openTurn(agent.session)
+    const result = await callStage(ctx, GOTO_STAGE, agent, { stage: 'implement', handoff: '# 交接' })
+    expect(result.isError).toBe(false)
+    expect(asked).toHaveLength(1)
+    expect(asked[0]?.questions[0]?.header).toBe(ZH.review.header)
+    expect(asked[0]?.questions[0]?.question)
+      .toBe(formatPrompt(ZH.review.fullQuestion, { stage: 'implement' }))
+    expect(asked[0]?.questions[0]?.detail).toBe('# 交接')
+    expect(asked[0]?.questions[0]?.options?.map(option => option.label))
+      .toEqual([ZH.review.approveLabel, ZH.review.keepStageLabel])
+    // The switch still lands: the boundary flush records the new stage.
+    await boundary(ctx, agent, 'step-start')
+    expect(foldStage(agent.session.snapshotEvents())).toBe('implement')
+  })
+
   it('unloads cleanly: disposing the plugin fiber removes the service, the tool, and the command', { timeout: 60_000 }, async () => {
     const { ctx, agent } = await loadComposition()
     await boundary(ctx, agent, 'pre-step')
@@ -332,5 +370,8 @@ describe('real Loader composition through cordis.yml', () => {
     await boundary(ctx, agent, 'step-start')
     expect(stageNoticeSummaries(agent.session)).toHaveLength(1)
     expect(foldStage(agent.session.snapshotEvents())).toBe('explore')
+    // The projection registration was effect-scoped on the plugin's fiber:
+    // disposal removes the key (capability absence, not a stale read path).
+    expect(ctx.sessionProjections.stateOf(agent.session, 'stage')).toBeUndefined()
   })
 })

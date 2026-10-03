@@ -9,6 +9,14 @@
  * embedded {@link DEFAULT_STAGE_SWITCH_PROMPTS} keep the plugin fully
  * functional with the exact strings it always shipped.
  *
+ * The Chinese review-dialog overlay (`src/prompts.zh.json`, the `review.*`
+ * strings) is a second dictionary read here at module load: the service
+ * resolves it at construction when its `language` config is `zh` (the
+ * deployment-declared route — the choice lives in the composition, survives
+ * reinstalls, and needs no post-install script). `scripts/apply-zh.mjs`
+ * remains the file-level alternative for deployments that prefer merging
+ * the overlay into the installed `src/prompts.json` directly.
+ *
  * @module @ai4rpg/dsh-stage-switch/prompts
  */
 
@@ -36,6 +44,15 @@ function promptJsonCandidates(): string[] {
   ]
 }
 
+/** Candidate Chinese-overlay paths, in preference order (source tree first). */
+function promptZhCandidates(): string[] {
+  const here = dirname(fileURLToPath(import.meta.url))
+  return [
+    join(here, 'prompts.zh.json'),
+    join(here, '..', 'src', 'prompts.zh.json'),
+  ]
+}
+
 /**
  * Read the effective prompts: the embedded defaults overlaid with
  * `src/prompts.json` when it is readable. The JSON wins on every key it
@@ -55,6 +72,36 @@ export function readStageSwitchPrompts(): StageSwitchPrompts {
 
 /** The effective prompts for this process, read once at module load. */
 export const stageSwitchPrompts: StageSwitchPrompts = readStageSwitchPrompts()
+
+/** The languages this package ships dictionaries for. */
+export type StageSwitchLanguage = 'en' | 'zh'
+
+/** The Chinese review-dialog overlay, read once at module load; absent file = none. */
+const ZH_OVERLAY: unknown = (() => {
+  for (const candidate of promptZhCandidates()) {
+    try {
+      return JSON.parse(readFileSync(candidate, 'utf8')) as unknown
+    } catch {
+      // Try the next candidate; with none readable there is no overlay.
+    }
+  }
+  return undefined
+})()
+
+/**
+ * Resolve the effective prompts for one language: `en` is the loaded set
+ * unchanged (the source tree's language); `zh` deep-merges the Chinese
+ * review-dialog overlay over it — the same merge `scripts/apply-zh.mjs`
+ * performs at install time, done at runtime from the plugin's `language`
+ * config instead, so the choice lives in the composition rather than in the
+ * installed files and survives every reinstall.
+ * @param language - the deployment's declared language.
+ * @returns the prompts the service renders.
+ */
+export function resolveStageSwitchPrompts(language: StageSwitchLanguage): StageSwitchPrompts {
+  if (language === 'en' || ZH_OVERLAY === undefined) return stageSwitchPrompts
+  return deepMerge(stageSwitchPrompts, ZH_OVERLAY) as StageSwitchPrompts
+}
 
 /** Substitute `{name}` placeholders with the given values (unmatched kept). */
 export function formatPrompt(template: string, values: Record<string, string>): string {

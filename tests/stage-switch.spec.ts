@@ -16,7 +16,7 @@ import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import StageController, { GOTO_STAGE, foldStage, resolveConfig } from '../src/index.ts'
 import type { StageConfig } from '../src/index.ts'
-import { stageSwitchPrompts, formatPrompt } from '../src/prompts.ts'
+import { stageSwitchPrompts, formatPrompt, resolveStageSwitchPrompts } from '../src/prompts.ts'
 import { DEFAULT_STAGE_SWITCH_PROMPTS } from '../src/prompts.defaults.ts'
 import {
   APPROVE_LABEL, KEEP_LABEL, MemoryFs, STAGE_CONFIG,
@@ -91,6 +91,9 @@ async function agentWithSession(
 
 async function setup(config: StageConfig = STAGE_CONFIG): Promise<Context> {
   const ctx = new Context()
+  // The projection registry is a required injection of the service (the
+  // stage unit registers in the constructor); mount it first.
+  await ctx.plugin(SessionProjection)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
   await ctx.plugin(StageController, config)
@@ -211,6 +214,14 @@ describe('resolveConfig', () => {
   it('rejects a negative token threshold', () => {
     expect(() => resolveConfig({ ...STAGE_CONFIG, minHandoffTokens: -1 }))
       .toThrow('non-negative finite number')
+  })
+
+  it('accepts the shipped languages and rejects any other', () => {
+    expect(resolveConfig({ ...STAGE_CONFIG, language: 'zh' }).language).toBe('zh')
+    expect(resolveConfig({ ...STAGE_CONFIG, language: 'en' }).language).toBe('en')
+    expect(resolveConfig(STAGE_CONFIG).language).toBeUndefined()
+    expect(() => resolveConfig({ ...STAGE_CONFIG, language: 'fr' as never }))
+      .toThrow('must be "en" or "zh"')
   })
 
   it('rejects unknown keys', () => {
@@ -439,6 +450,30 @@ describe('goto_stage registration', () => {
 })
 
 describe('goto_stage validation', () => {
+  it('renders the review dialog in Chinese when the language config is zh', async () => {
+    // The deployment-declared route: the row config picks the dictionary at
+    // construction, so the review dialog renders the zh overlay's strings
+    // with no install-time merge. Expectations derive from the same resolver
+    // the service uses, so a copy edit never forces a test edit.
+    const zh = resolveStageSwitchPrompts('zh')
+    const { ctx, agent, asked } = await setupWithReview(
+      { ...STAGE_CONFIG, language: 'zh' },
+      { selected: [zh.review.approveLabel] },
+    ).run()
+    await ctx.plugin(MemoryFs)
+    openTurn(agent.session)
+    const result = await callStage(ctx, GOTO_STAGE, agent, {
+      stage: 'implement',
+      handoff: '# Handoff',
+    })
+    expect(result.isError).toBe(false)
+    expect(asked).toHaveLength(1)
+    expect(asked[0]?.questions[0]?.header).toBe(zh.review.header)
+    // No threshold configured, so the review is the full-transition question.
+    expect(asked[0]?.questions[0]?.question).toBe(formatPrompt(zh.review.fullQuestion, { stage: 'implement' }))
+    expect(asked[0]?.questions[0]?.options?.map(option => option.label))
+      .toEqual([zh.review.approveLabel, zh.review.keepStageLabel])
+  })
   it('rejects an agent-less call', async () => {
     const ctx = await setup()
     const result = await callStage(ctx, GOTO_STAGE, undefined, { stage: 'implement', handoff: '# Handoff' })
@@ -551,7 +586,6 @@ describe('goto_stage presentationMeta (full-transition marker)', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     await ctx.plugin(MemoryFs)
-    await ctx.plugin(SessionProjection)
     await ctx.plugin(TokenMeter)
     ctx.on('user-questions/request', () => Promise.resolve({
       answers: [{ id: 'stage-review', selected: [APPROVE_LABEL] }],
@@ -762,6 +796,7 @@ describe('goto_stage full transition', () => {
 
   it('fails the call when the plugin is disposed while the review awaits', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjection)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     const fiber = await ctx.plugin(StageController, STAGE_CONFIG)
@@ -790,7 +825,6 @@ describe('goto_stage token-threshold transitions', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     await ctx.plugin(MemoryFs)
-    await ctx.plugin(SessionProjection)
     await ctx.plugin(TokenMeter)
     const asked: AskUserQuestionRequest[] = []
     ctx.on('user-questions/request', (request) => {
@@ -1073,6 +1107,7 @@ describe('HMR disposal', () => {
   // must leave the system-prompt assembly when the plugin fiber is disposed.
   it('unregisters the stage:policy context with the plugin fiber', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjection)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     const fiber = await ctx.plugin(StageController, STAGE_CONFIG)

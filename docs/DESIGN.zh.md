@@ -16,7 +16,11 @@ Status: implemented
 
 ### 本包：`@ai4rpg/dsh-stage-switch`
 
-本包独立开发与发布，构建与发布均针对 npm 上的 `@deepseek-ai/dsh-*` 包：与 plan mode 一样，是通过 session、prompt、tool 与 interaction seam 贡献的、记录到日志的按 agent 协作状态。持久事实是每次进入都会追加的阶段提示消息——`Current stage: <name>` 或交接提示 `Stage switched to <name>` 两种 `user/message`，其 `source.summary` 由 `foldStage(events)` 折叠，空日志值取配置的 `initial` 阶段。记录的 source 为生产者自有（`kind: 'stage-switch'`、`notice` 形态）；更早版本写入的记录经 harness 的 V3→V4 会话转换后以 `plugin:stage-switch` 返回，`foldStage` 同时接受两种 kind，因此旧会话 resume 仍落在其记录的阶段上。`ctx.stage.current(session)` 读取当前状态。
+本包独立开发与发布，构建与发布均针对 npm 上的 `@deepseek-ai/dsh-*` 包：与 plan mode 一样，是通过 session、prompt、tool 与 interaction seam 贡献的、记录到日志的按 agent 协作状态。持久事实是每次进入都会追加的阶段提示消息——`Current stage: <name>` 或交接提示 `Stage switched to <name>` 两种 `user/message`，其 `source.summary` 由 `foldStage(events)` 折叠，空日志值取配置的 `initial` 阶段。记录的 source 为生产者自有（`kind: 'stage-switch'`、`notice` 形态）；更早版本写入的记录经 harness 的 V3→V4 会话转换后以 `plugin:stage-switch` 返回，`foldStage` 同时接受两种 kind，因此旧会话 resume 仍落在其记录的阶段上。`ctx.stage.current(session)` 读取当前状态——经由会话投影 seam，绝不扫描日志（见下节）。
+
+### 读取经由会话投影 seam
+
+服务在 `ctx.sessionProjections`（必需注入）上注册唯一一个 host 侧投影单元（`key: 'stage'`）。框架的 eager 驱动对每个已提交事件施加与 `foldStage` 相同的逐事件记录逻辑，外加边界机制所需的状态：最后一个 `request/header` 处的阶段（叙述判定）、开回合标志（空闲提交 vs 排队提交）、日志是否已携带阶段提示（仅一次的初始注入），以及表面头节点的种类——node 0 是否为完整切换替换必须跳过的受保护 `system/message`。读取（`stateOf`）只推进新增事件，且 base bundle 的投影缓存会做检查点，因此 resume 的会话至多重折叠一个尾部。这取代了早前版本每次读取都做的全日志扫描：harness 已废弃同步的全日志读取器（`Session.snapshotEvents()` 等），因为存储方向不再在内存中保留完整事件序列，而投影 seam 是官方认可的替代。该单元没有 client wire view——侧栏客户端包按设计自行折叠持久记录，且必须在从未挂载本插件的组合上继续可用。key 缺失（重载竞态）按 seam 的强制读取规则大声失败，绝不静默取默认值；注册以 effect 作用域挂在服务的 fiber 上，因此 HMR 卸载会移除该 key。
 
 ### 解耦的判定器 seam
 
@@ -52,7 +56,7 @@ Status: implemented
 
 本包自带的用户可见文案--`goto_stage` 工具描述与参数提示、评审对话框(问题、标签、选项描述)、工具结果与呈现卡片文案、边界/交接 notice、`/stage` 命令文案、失败信息--都集中在 `src/prompts.json`,即唯一可编辑事实源。`src/prompts.ts` 在模块加载时读取它,并叠加在嵌入兜底(`src/prompts.defaults.ts`,由 JSON 重新生成)之上,因此没有 JSON 的过期安装会回退到与包历代完全一致的文案。`{name}` 占位符由 `formatPrompt` 插值。承载格式刻意留在代码,因为 fold 与提示注入路径要解析它们:阶段提示正文前缀(`Current stage: <name>`)、`source.summary` 的 notice 形态(`Current stage: <name>` / `Stage switched to <name>`)、`stage-review` 问题 id。文案直接在 `src/prompts.json` 里改；`prebuild`/`pretest` 钩子会跑 `scripts/sync-prompts.mjs` 重生成嵌入兜底；手工只改其一而不重新生成，会被"加载的 JSON 叠加必须等于嵌入兜底"的包测试抓住。行为测试从不内嵌文案：期望一律从生效提示词（`stageSwitchPrompts` + `formatPrompt`）推导，因此改文案只改 prompts——测试继续钉住接线，即配置的文案确实到达工具 schema、评审对话框、notice 与命令输出。
 
-额外的中文评审弹窗覆盖层通过 `src/prompts.zh.json` 提供（仅 `review.*` 8 条键值）。这是 sync-prompts 脚本不处理的第二事实源：`scripts/apply-zh.mjs` 在安装后将中文文案深度合并到已装 `src/prompts.json` 中（重装/升级后需重跑），其他所有键保持英文。`src/prompts.zh.json` 在运行时是无源的——没有任何代码读取它——直到合并写入加载器读取的 JSON 文件。这使源树保持英文（上述钉住测试仍然成立），并将语言切换限制在已装副本上，后者在 `file:`、npm 和 GitHub release 安装时均有效。
+额外的中文评审弹窗覆盖层通过 `src/prompts.zh.json` 提供（仅 `review.*` 8 条键值）。这是 sync-prompts 脚本不处理的第二事实源，且在运行时被读取：当插件行配置声明 `language: zh` 时，服务在构造时经 `resolveStageSwitchPrompts` 解析它，把中文文案深度合并到已加载文案之上。部署声明式路径使源树保持英文（上述钉住测试仍然成立），并把语言选择放进组合——挂载本插件的同一份 patch——因此它在 `file:`、npm 和 GitHub release 安装时均有效，且无需安装后步骤。`scripts/apply-zh.mjs` 仍作为文件级替代保留（安装后将同一份覆盖层深度合并进已装 `src/prompts.json`，重装/升级后需重跑），供无法编辑组合的部署使用；dsh 0.2.0 没有 Host 侧词典服务，因此插件自身配置是 host 组装文案的官方 seam。
 
 ### 与 plan mode 共享的边界语义
 
@@ -72,8 +76,8 @@ Status: implemented
 
 ## 验证
 
-- 单元测试（手搭的 `ctx.plugin(...)` 套件）覆盖配置校验、阶段折叠（notice summary 及其优先级）、提示词文案单一事实源钉住、策略上下文渲染与变量、判定器注册与移除、`goto_stage` schema 与校验链、持久化 full-transition 标记、评审回答规则与失败模式、呈现、token 阈值决策、交接路径按会话隔离与 sandbox policy 戳记、归档形态，以及 fiber 移除时 `stage:policy` 的清理。
-- 真实 Loader 组合套件通过 `@deepseek-ai/cordis-plugin-loader` 启动测试专用的 `cordis.yml`——只 mock 文件系统后端与评审回答——钉住产品可见接线：三注册表贡献（service、tool、command）、仅一次的初始阶段提示注入、从交接写入经评审与边界冲刷到持久化 `Stage switched to <stage>` notice 的完整 `goto_stage` 切换、`/stage` 空闲提交，以及干净卸载。
+- 单元测试（手搭的 `ctx.plugin(...)` 套件）覆盖配置校验、阶段折叠（notice summary 及其优先级）——如今所有服务行为都经由注册的投影单元——提示词文案单一事实源钉住、策略上下文渲染与变量、判定器注册与移除、`goto_stage` schema 与校验链、持久化 full-transition 标记、评审回答规则与失败模式、呈现、token 阈值决策、交接路径按会话隔离与 sandbox policy 戳记、归档形态，以及 fiber 移除时 `stage:policy` 的清理。
+- 真实 Loader 组合套件通过 `@deepseek-ai/cordis-plugin-loader` 启动测试专用的 `cordis.yml`——只 mock 文件系统后端与评审回答——钉住产品可见接线：三注册表贡献（service、tool、command）、仅一次的初始阶段提示注入、存活的 `stage` 投影状态及其在卸载时的移除、从交接写入经评审与边界冲刷到持久化 `Stage switched to <stage>` notice 的完整 `goto_stage` 切换、`/stage` 空闲提交，以及干净卸载。
 - 评审弧与 surface 替换用真实 `Session` 与内存文件系统后端做包级测试；组装应用转录与专用 `stage-review` Web 渲染器属于延后工作。
 
 ## 后果

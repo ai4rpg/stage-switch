@@ -9,6 +9,7 @@
 ## 持久状态
 
 阶段记录搭载在每次阶段进入都会追加的 stage-switch 插件消息上——阶段提示（`Current stage: <name>`）或交接提示（`Stage switched to <name>`），都是官方 harness 事件目录已知的普通 `user/message`。每条记录的 source 为生产者自有：`kind: 'stage-switch'`，`notice` 形态并携带 summary。更早版本写入的记录经 harness 的 V3→V4 会话转换后以 `plugin:stage-switch` 返回；`foldStage` 同时接受两种 kind，因此旧会话 resume 仍落在其记录的阶段上。`foldStage(events)` 返回最后一条记录的阶段，无记录时为 `undefined`；服务在第一条记录之前折叠到配置的 `initial` 阶段（默认第一个阶段），因此 resume、fork 与 compaction 直接从会话日志恢复阶段。UI 通过 `session/event` 观察已提交的切换。
+读取经由服务注册在 `ctx.sessionProjections` 上的 `stage` 会话投影单元（必需注入）：由框架对已提交事件驱动同一套逐事件折叠并做检查点，因此每次读取只花 O(新增事件) 而不是全量扫描日志——harness 已废弃同步的全日志读取器，本包对它们的调用数为零。该单元只存在于 host 侧（无 client wire view）；侧栏客户端包仍自行折叠持久记录。
 `ctx.stage.current(session)` 读取当前阶段。已评审的切换保持 pending，在下一个被接受的 in-turn pre-step 应用，因此当前工具批次保持其阶段上下文，切换由工具结果自身叙述。
 
 ## 判定器 seam
@@ -59,9 +60,9 @@
     minHandoffTokens: 4000
 ```
 
-`stages` 必填、非空、名称唯一；名称必须匹配 `[a-z][a-z0-9_-]*`，以保证交接文件名安全。每份交接文档落在会话 cwd 下的 `<handoffDir>/<会话 id>/<stage>.md`——按会话分目录让共享同一工作区的会话互不覆盖彼此的文档。`section` 必填且非空。`handoffDir` 默认 `handoff`；`initial` 默认第一个阶段且必须命名已配置的阶段；`minHandoffTokens` 可选且必须非负。未知 key 在加载时失败。
+`stages` 必填、非空、名称唯一；名称必须匹配 `[a-z][a-z0-9_-]*`，以保证交接文件名安全。每份交接文档落在会话 cwd 下的 `<handoffDir>/<会话 id>/<stage>.md`——按会话分目录让共享同一工作区的会话互不覆盖彼此的文档。`section` 必填且非空。`handoffDir` 默认 `handoff`；`initial` 默认第一个阶段且必须命名已配置的阶段；`minHandoffTokens` 可选且必须非负；`language` 选择评审弹窗语言——`en`（默认）或 `zh`，即中文评审弹窗词典（见下文）。未知 key 在加载时失败。
 
-配置了 `minHandoffTokens` 时，组合中需要 `@deepseek-ai/dsh-token-meter`；缺失时 `goto_stage` 调用会大声失败。
+配置了 `minHandoffTokens` 时，组合中需要 `@deepseek-ai/dsh-token-meter`；缺失时 `goto_stage` 调用会大声失败。服务的投影读取还需要 `@deepseek-ai/dsh-session-projection`——harness 的 base bundle 已挂载它，因此标准组合天然具备；缺失时激活阶段即大声失败。
 
 ## 提示词文案
 
@@ -84,17 +85,35 @@ npm run build                                # prebuild 钩子自动跑 sync-pro
 
 直接手改 `src/prompts.json` 后跑 `npm run build`（`prebuild` 钩子自动重生成 `src/prompts.defaults.ts`）；`npm run test` 也通过 `pretest` 重生成。然后在部署处重装本包。直接手改 `src/prompts.json` 再跑 `node scripts/sync-prompts.mjs` 效果相同。
 
-### 中文评审弹窗覆盖（可选）
+### 中文评审弹窗文案
 
-本包带一份中文评审弹窗文案覆盖层（`src/prompts.zh.json`，8 条键值）。安装后对已装副本执行：
+本包带一份中文评审弹窗文案覆盖层
+（`src/prompts.zh.json`，8 条键值）；其他用户可见文案（工具描述、提示消息、
+错误信息、命令文本等）保持英文。
+
+**部署声明式路径（推荐）：** 在插件行上设置 `language: zh`——服务在构造时
+解析中文词典，因此该选择存在于组合中（挂载本插件的同一份 patch 里），
+每次重装都保留，且无需任何安装后脚本：
+
+```yaml
+- id: stage-switch
+  name: '@ai4rpg/dsh-stage-switch'
+  config:
+    language: zh
+    # ...stages、section 及其余配置
+```
+
+**文件级路径（旧法）：** 改为合并到已装副本——适用于无法编辑组合的部署：
 
 ```sh
 node node_modules/@ai4rpg/dsh-stage-switch/scripts/apply-zh.mjs
 ```
 
-该脚本将中文评审文案深度合并到已装的 `src/prompts.json` 中，其他用户可见文案（工具描述、提示消息、错误信息、命令文本等）保持英文。内嵌兜底（`lib/prompts.defaults.js`）不受影响——安装包丢失 JSON 文件时仍回退到英文。
-
-回退方法：重装包（`dsh plugin remove + add` 或 `pnpm install`/`npm install`），恢复英文 `src/prompts.json`。**每次重装或升级后重新运行该脚本**。
+该脚本将中文评审文案深度合并到已装的
+`src/prompts.json` 中。内嵌兜底（`lib/prompts.defaults.js`）不受影响——
+安装包丢失 JSON 文件时仍回退到英文。回退文件级合并：重装包
+（`dsh plugin remove + add`），恢复英文 `src/prompts.json`。**每次重装或升级后
+重新运行该脚本**——或改用配置路径，它没有这一步。
 
 ## 模型体验
 

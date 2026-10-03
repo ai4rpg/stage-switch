@@ -8,9 +8,12 @@
  * conversation exceeds a token threshold, or switching without a handoff when
  * it does not.
  *
- * The state in force is folded from the session log (the last stage record
- * wins — see {@link foldStage}), so resume and fork restore it without a live
- * mirror. A reviewed transition remains pending until the next accepted
+ * The state in force is maintained by the `stage` session-projection unit
+ * (the last stage record wins — the unit applies the same per-event fold as
+ * the exported {@link foldStage}), so reads advance over new events instead
+ * of rescanning history, and resume and fork restore the state through the
+ * framework's projection lifecycle. A reviewed transition remains pending
+ * until the next accepted
  * in-turn pre-step: the step appends the stage prompt message and, in the
  * full-transition shape, replaces the whole model-visible surface with one
  * handoff notice before the step's own messages. The transition tool stays
@@ -27,18 +30,21 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
+import { z } from 'zod'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { FileSystem } from '@deepseek-ai/dsh-fs'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
+import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed, MessageSource } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionSeq, UserMessage } from '@deepseek-ai/dsh-session'
+import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import { UserQuestionError } from '@deepseek-ai/dsh-user-questions'
 import type { UserQuestionService } from '@deepseek-ai/dsh-user-questions'
-import { stageSwitchPrompts, formatPrompt } from './prompts.ts'
+import { formatPrompt, resolveStageSwitchPrompts, type StageSwitchLanguage, type StageSwitchPrompts } from './prompts.ts'
 // Type-only edge: resolves `ctx.commands` for the optional command child.
 import type {} from '@deepseek-ai/dsh-commands'
 
@@ -62,6 +68,19 @@ declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'stage-switch': { kind: 'stage-switch' } & ContextFormed
     'plugin:stage-switch': { kind: 'plugin:stage-switch' } & ContextFormed
+  }
+}
+
+/**
+ * The `stage` projection key this package owns on the session-projection
+ * seam: a host-only unit with no client wire view. The sidebar client
+ * package folds the durable records itself by design (zero RPC, and it must
+ * keep working on sessions whose composition never mounted this plugin), so
+ * nothing here publishes a wire value.
+ */
+declare module '@deepseek-ai/dsh-session-projection/types' {
+  interface SessionProjectionStateMap {
+    stage: StageProjectionState
   }
 }
 
@@ -103,6 +122,14 @@ export interface StageConfig {
    * clearing the conversation. Omit to always require the full transition.
    */
   minHandoffTokens?: number
+  /**
+   * The language the user-facing copy renders in: `en` (default, the source
+   * tree's language) or `zh` (the Chinese review-dialog overlay). Declared by
+   * the deployment in the composition — the same patch that mounts this
+   * plugin — so the choice survives reinstalls and needs no post-install
+   * script (the file-level `scripts/apply-zh.mjs` merge remains available).
+   */
+  language?: StageSwitchLanguage
 }
 
 /** The review question's id, echoed in the answer this tool reads. */
@@ -190,8 +217,12 @@ export function resolveConfig(config: StageConfig): StageConfig {
     && (!Number.isFinite(minHandoffTokens) || minHandoffTokens < 0)) {
     throw new Error('StageConfig `minHandoffTokens` must be a non-negative finite number when supplied')
   }
+  const language = (config as Partial<StageConfig>).language
+  if (language !== undefined && language !== 'en' && language !== 'zh') {
+    throw new Error(`StageConfig \`language\` must be "en" or "zh", got ${JSON.stringify(language)}`)
+  }
   const unknown = Object.keys(config).filter(key => ![
-    'stages', 'section', 'handoffDir', 'initial', 'minHandoffTokens',
+    'stages', 'section', 'handoffDir', 'initial', 'minHandoffTokens', 'language',
   ].includes(key))
   if (unknown.length > 0) {
     throw new Error(`StageConfig has unknown key(s) ${unknown.join(', ')}`)
@@ -202,6 +233,7 @@ export function resolveConfig(config: StageConfig): StageConfig {
     ...handoffDir === undefined ? {} : { handoffDir },
     ...initial === undefined ? {} : { initial },
     ...minHandoffTokens === undefined ? {} : { minHandoffTokens },
+    ...language === undefined ? {} : { language },
   }
 }
 
@@ -265,40 +297,81 @@ function stageFromEvent(event: SessionEvent): string | undefined {
   return STAGE_SUMMARY.exec(summary)?.[1]
 }
 
-/** Whether the log holds an opened turn without its closing `turn/end`. */
-function hasOpenTurn(events: readonly SessionEvent[]): boolean {
-  let open = false
-  for (const event of events) {
-    if (event.type === 'turn/start') open = true
-    else if (event.type === 'turn/end') open = false
-  }
-  return open
+/** Plain-JSON checkpoint schema for the `stage` projection unit. */
+const stageProjectionStateSchema = z.object({
+  stage: z.string().nullable(),
+  stageAtLastHeader: z.string().nullable(),
+  openTurn: z.boolean(),
+  hasStagePrompt: z.boolean(),
+  headSeq: z.number().int().nonnegative().nullable(),
+  headIsSystem: z.boolean(),
+}).strict()
+
+/** Whether one event is a stage prompt message (any stage entry). */
+function isStagePromptEvent(event: SessionEvent): boolean {
+  if (event.type !== 'user/message') return false
+  if (!STAGE_SOURCE_KINDS.has(event.data.source.kind)) return false
+  return event.data.content
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+    .map(block => block.text)
+    .join('')
+    .includes('Current stage:')
 }
 
-/** Stage at the last logged request header, or `undefined` before the first header. */
-function stageAtLastHeader(events: readonly SessionEvent[]): string | undefined {
-  let lastHeader = -1
-  let index = 0
-  for (const event of events) {
-    if (event.type === 'request/header') lastHeader = index
-    index++
-  }
-  if (lastHeader < 0) return undefined
-  return foldStage(events, lastHeader + 1)
+/**
+ * Surface node 0 after one committed event. An append fills only an empty
+ * surface; a replacement shadows the head exactly when its declared range
+ * starts there (the harness locates ranges by node position, so
+ * `startSeq === headSeq` is precisely "the range covers node 0"); every other
+ * event leaves the head's position alone. Once node 0 is a `system/message`
+ * it stays one — the harness permits rewriting it only with another
+ * `system/message` over exactly that node.
+ */
+function surfaceHeadAfter(
+  state: StageProjectionState,
+  event: SessionEvent,
+): { headSeq: number | null; headIsSystem: boolean } {
+  const op = event.surfaceOp
+  if (op === undefined) return { headSeq: state.headSeq, headIsSystem: state.headIsSystem }
+  const becomesHead = op === 'append'
+    ? state.headSeq === null
+    : op.startSeq === state.headSeq
+  if (!becomesHead) return { headSeq: state.headSeq, headIsSystem: state.headIsSystem }
+  return { headSeq: event.seq, headIsSystem: event.type === 'system/message' }
 }
 
-/** Whether the log already carries a stage prompt message (any stage entry). */
-function hasStagePrompt(events: readonly SessionEvent[]): boolean {
-  for (const event of events) {
-    if (event.type !== 'user/message') continue
-    if (!STAGE_SOURCE_KINDS.has(event.data.source.kind)) continue
-    const text = event.data.content
-      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
-      .map(block => block.text)
-      .join('')
-    if (text.includes('Current stage:')) return true
-  }
-  return false
+/**
+ * The `stage` projection unit: the pure fold the framework drives eagerly
+ * over committed events. It applies the same per-event record logic as the
+ * exported {@link foldStage} (plus the header watermark, the open-turn flag,
+ * the stage-prompt flag, and the surface head), so the unit and the exported
+ * fold cannot disagree on what a record means. An event that changes
+ * nothing returns the same state reference — the unit contract that keeps
+ * downstream work at zero.
+ */
+const stageProjectionDefinition: ProjectionDefinition<'stage'> = {
+  key: 'stage',
+  stateVersion: 1,
+  stateSchema: stageProjectionStateSchema,
+  init: () => ({
+    stage: null,
+    stageAtLastHeader: null,
+    openTurn: false,
+    hasStagePrompt: false,
+    headSeq: null,
+    headIsSystem: false,
+  }),
+  apply: (state, event) => {
+    const stage = stageFromEvent(event) ?? state.stage
+    const stageAtLastHeader = event.type === 'request/header' ? stage : state.stageAtLastHeader
+    const openTurn = event.type === 'turn/start' ? true : event.type === 'turn/end' ? false : state.openTurn
+    const hasStagePrompt = state.hasStagePrompt || isStagePromptEvent(event)
+    const head = surfaceHeadAfter(state, event)
+    if (stage === state.stage && stageAtLastHeader === state.stageAtLastHeader
+      && openTurn === state.openTurn && hasStagePrompt === state.hasStagePrompt
+      && head.headSeq === state.headSeq && head.headIsSystem === state.headIsSystem) return state
+    return { stage, stageAtLastHeader, openTurn, hasStagePrompt, ...head }
+  },
 }
 
 /**
@@ -330,13 +403,37 @@ function isSubagentSession(session: Session): boolean {
  * backends ignore the argument).
  */
 function sessionSandboxPolicy(ctx: Context, session: Session): SandboxExecutionPolicy | undefined {
-  // Read the optional service through cordis's dynamic accessor; its Context
-  // augmentation lives in @deepseek-ai/dsh-sandbox-policy, which this package
-  // keeps out of its dependency set, so the lookup is typed structurally.
-  const service = (ctx as unknown as {
-    get(name: 'sandboxPolicy'): { resolve(request?: { session?: Session }): SandboxExecutionPolicy } | undefined
-  }).get('sandboxPolicy')
-  return service?.resolve({ session })
+  // The optional service is read through cordis's dynamic accessor: the
+  // sandbox-policy plugin is not a dependency of this package, so the
+  // composition decides whether it is present (unsandboxed backends ignore
+  // the argument). The type-only import above types the lookup.
+  return ctx.get('sandboxPolicy')?.resolve({ session })
+}
+
+/**
+ * Everything the service reads off the session log, maintained as one
+ * session-projection unit so no read scans history. The harness deprecated
+ * the synchronous whole-log readers (`Session.snapshotEvents()` and friends)
+ * because the storage direction stops retaining the complete event sequence
+ * in memory, and the projection seam is the sanctioned replacement: the
+ * framework drives `apply` over committed events and checkpoints the state
+ * (the base bundle's projection cache), so reads cost O(new events) and a
+ * resumed session refolds at most a tail. All fields are plain JSON — the
+ * persisted-cache precondition.
+ */
+interface StageProjectionState {
+  /** The stage in force (the last stage record), or `null` before the first. */
+  stage: string | null
+  /** The stage in force at the last `request/header`, or `null` before the first header. */
+  stageAtLastHeader: string | null
+  /** Whether the log holds an opened turn without its closing `turn/end`. */
+  openTurn: boolean
+  /** Whether the log already carries a stage prompt message (any stage entry). */
+  hasStagePrompt: boolean
+  /** Seq of surface node 0, or `null` while the surface is empty. */
+  headSeq: number | null
+  /** Whether surface node 0 is a `system/message` — the protected head. */
+  headIsSystem: boolean
 }
 
 /**
@@ -344,10 +441,11 @@ function sessionSandboxPolicy(ctx: Context, session: Session): SandboxExecutionP
  * and eligibility guidance context, the eligibility seam, and the stable
  * `goto_stage` tool. Reviewed transitions flush at the next accepted
  * in-turn pre-step; UIs observe committed switches through `session/event`.
- * There is no live mirror.
+ * The `stage` projection unit is the framework-owned read state; the log
+ * stays the durable record.
  */
 export class StageController extends Service {
-  static inject = ['tools', 'systemPrompt']
+  static inject = ['tools', 'systemPrompt', 'sessionProjections']
 
   /** Validated stage definitions indexed by name. */
   private readonly stages: readonly StageDefinition[]
@@ -358,6 +456,8 @@ export class StageController extends Service {
   private readonly section: string
   private readonly handoffDir: string
   private readonly minHandoffTokens: number | undefined
+  /** The user-facing copy this instance renders, resolved from its `language` config. */
+  private readonly prompts: StageSwitchPrompts
 
   /** Registered synchronous eligibility predicates; ANY true enables switching. */
   private readonly eligibility = new Set<(agent: Agent) => boolean>()
@@ -379,6 +479,13 @@ export class StageController extends Service {
     this.section = resolved.section
     this.handoffDir = resolved.handoffDir ?? 'handoff'
     this.minHandoffTokens = resolved.minHandoffTokens
+    this.prompts = resolveStageSwitchPrompts(resolved.language ?? 'en')
+    // The read state: one host-only projection unit the framework drives
+    // eagerly over committed events (see {@link StageProjectionState}).
+    // Registration is effect-scoped on this service's fiber, so an HMR
+    // disposal removes the key; {@link projectionOf} makes an absent key a
+    // loud failure, never a silent default.
+    ctx.sessionProjections.register(stageProjectionDefinition)
     let disposed = false
     // Pre-step is outside Session.append publication, so it can append the
     // stage prompt message inside an open turn without re-entering the
@@ -414,7 +521,7 @@ export class StageController extends Service {
       // instruction ("classify the request and call goto_stage") is at best
       // redundant and at worst deadlocks the child when its goto_stage review
       // has no user to answer. See isSubagentSession above.
-      if (!hasStagePrompt(session.snapshotEvents()) && !isSubagentSession(session)) {
+      if (!this.projectionOf(session).hasStagePrompt && !isSubagentSession(session)) {
         return { ...decision, messages: [...decision.messages, this.stagePromptMessage(this.initial, false)] }
       }
       return decision
@@ -449,12 +556,12 @@ export class StageController extends Service {
 
     ctx.tools.register(defineTool({
       name: GOTO_STAGE,
-      description: stageSwitchPrompts.gotoTool.description,
+      description: this.prompts.gotoTool.description,
       parameters: {
-        stage: { type: 'string', required: true, description: stageSwitchPrompts.gotoTool.stageParam },
+        stage: { type: 'string', required: true, description: this.prompts.gotoTool.stageParam },
         handoff: {
           type: 'string',
-          description: stageSwitchPrompts.gotoTool.handoffParam,
+          description: this.prompts.gotoTool.handoffParam,
         },
       },
       output: {
@@ -469,10 +576,10 @@ export class StageController extends Service {
         },
         render: (_args, value) => [{
           type: 'text',
-          text: formatPrompt(stageSwitchPrompts.toolResult.approved, { stage: value.stage })
+          text: formatPrompt(this.prompts.toolResult.approved, { stage: value.stage })
             + (value.handoffPath === undefined
               ? ''
-              : formatPrompt(stageSwitchPrompts.toolResult.handoffPath, { path: value.handoffPath })),
+              : formatPrompt(this.prompts.toolResult.handoffPath, { path: value.handoffPath })),
         }],
         // A durable, model-invisible marker that a full transition was
         // approved and applied. `meta` rides the tool/result event (the
@@ -503,22 +610,22 @@ export class StageController extends Service {
         }
         const current = this.current(agent.session)
         if (!this.instructionByStage.has(args.stage)) {
-          throw new Error(formatPrompt(stageSwitchPrompts.errors.notConfigured,
+          throw new Error(formatPrompt(this.prompts.errors.notConfigured,
             { stage: args.stage, stages: this.stageNames }))
         }
         if (args.stage === current) {
-          throw new Error(formatPrompt(stageSwitchPrompts.errors.alreadyCurrent, { stage: args.stage }))
+          throw new Error(formatPrompt(this.prompts.errors.alreadyCurrent, { stage: args.stage }))
         }
         const interaction: UserQuestionService | undefined = this.ctx.get('userQuestions')
         if (interaction === undefined) {
-          throw new Error(stageSwitchPrompts.errors.noUserQuestions)
+          throw new Error(this.prompts.errors.noUserQuestions)
         }
         const full = this.requiresHandoff(agent.session)
         let handoff: string | undefined
         let handoffPath: string | undefined
         if (full) {
           if (typeof args.handoff !== 'string' || args.handoff.trim() === '') {
-            throw new Error(stageSwitchPrompts.errors.requiresHandoff)
+            throw new Error(this.prompts.errors.requiresHandoff)
           }
           handoff = args.handoff
           handoffPath = await this.writeHandoff(agent, args.stage, handoff, exec.signal)
@@ -526,12 +633,12 @@ export class StageController extends Service {
         const questions = full && handoff !== undefined
           ? [{
             id: REVIEW_ID,
-            header: stageSwitchPrompts.review.header,
-            question: formatPrompt(stageSwitchPrompts.review.fullQuestion, { stage: args.stage }),
+            header: this.prompts.review.header,
+            question: formatPrompt(this.prompts.review.fullQuestion, { stage: args.stage }),
             detail: handoff,
             options: [
-              { label: stageSwitchPrompts.review.approveLabel, description: stageSwitchPrompts.review.fullApproveDescription },
-              { label: stageSwitchPrompts.review.keepStageLabel, description: stageSwitchPrompts.review.keepStageDescription },
+              { label: this.prompts.review.approveLabel, description: this.prompts.review.fullApproveDescription },
+              { label: this.prompts.review.keepStageLabel, description: this.prompts.review.keepStageDescription },
             ],
             // The `stage-review` presentation intent from the DeepSeek Harness
             // monorepo is not yet in a published dsh-user-questions release;
@@ -540,11 +647,11 @@ export class StageController extends Service {
           }]
           : [{
             id: REVIEW_ID,
-            header: stageSwitchPrompts.review.header,
-            question: formatPrompt(stageSwitchPrompts.review.lightQuestion, { stage: args.stage }),
+            header: this.prompts.review.header,
+            question: formatPrompt(this.prompts.review.lightQuestion, { stage: args.stage }),
             options: [
-              { label: stageSwitchPrompts.review.approveLabel, description: stageSwitchPrompts.review.lightApproveDescription },
-              { label: stageSwitchPrompts.review.keepStageLabel, description: stageSwitchPrompts.review.keepStageDescription },
+              { label: this.prompts.review.approveLabel, description: this.prompts.review.lightApproveDescription },
+              { label: this.prompts.review.keepStageLabel, description: this.prompts.review.keepStageDescription },
             ],
           }]
         const answer = await interaction.ask({
@@ -558,7 +665,7 @@ export class StageController extends Service {
           // which the model never called. An abort (turn cancel, provider
           // teardown) keeps its own message — there is no user to wait for.
           if (cause instanceof UserQuestionError && cause.code === 'ASK_CANCELLED') {
-            throw new Error(stageSwitchPrompts.errors.dismissed)
+            throw new Error(this.prompts.errors.dismissed)
           }
           throw cause
         })
@@ -569,11 +676,11 @@ export class StageController extends Service {
         }
         const reviewItems = answer.answers.filter(entry => entry.id === REVIEW_ID)
         const item = reviewItems.length === 1 ? reviewItems[0] : undefined
-        if (item?.selected.length !== 1 || item.selected[0] !== stageSwitchPrompts.review.approveLabel || item.custom !== undefined) {
+        if (item?.selected.length !== 1 || item.selected[0] !== this.prompts.review.approveLabel || item.custom !== undefined) {
           const feedback = item?.custom ?? ''
           throw new Error(feedback === ''
-            ? stageSwitchPrompts.errors.keepPlanning
-            : formatPrompt(stageSwitchPrompts.errors.keepPlanningFeedback, { feedback }))
+            ? this.prompts.errors.keepPlanning
+            : formatPrompt(this.prompts.errors.keepPlanningFeedback, { feedback }))
         }
         // Keep the current stage for the rest of this assistant tool batch. The
         // transition is applied at the next accepted in-turn pre-step, before
@@ -588,13 +695,13 @@ export class StageController extends Service {
       },
       presentCall: args => ({
         card: 'generic',
-        title: formatPrompt(stageSwitchPrompts.present.callTitle, { stage: args.stage }),
+        title: formatPrompt(this.prompts.present.callTitle, { stage: args.stage }),
         kind: 'other',
-        content: [{ type: 'text', text: args.handoff ?? formatPrompt(stageSwitchPrompts.present.lightCallContent, { stage: args.stage }) }],
+        content: [{ type: 'text', text: args.handoff ?? formatPrompt(this.prompts.present.lightCallContent, { stage: args.stage }) }],
       }),
       presentResult: (_args, result) => ({
         card: 'generic',
-        title: stageSwitchPrompts.present.resultTitle,
+        title: this.prompts.present.resultTitle,
         content: result.content,
       }),
     }))
@@ -603,14 +710,14 @@ export class StageController extends Service {
     ctx.inject(['commands'], (commandCtx) => {
       commandCtx.commands.register({
         name: 'stage',
-        description: stageSwitchPrompts.command.description,
+        description: this.prompts.command.description,
         input: { hint: '[stage|message]' },
         handler: ({ agent, rawInput }) => {
           const message = rawInput.trim()
           if (message === '') {
             return {
               kind: 'success',
-              text: formatPrompt(stageSwitchPrompts.command.current,
+              text: formatPrompt(this.prompts.command.current,
                 { stage: this.current(agent.session), stages: this.stageNames }),
             }
           }
@@ -618,7 +725,7 @@ export class StageController extends Service {
           if (target === undefined || !this.instructionByStage.has(target)) {
             return {
               kind: 'error',
-              text: formatPrompt(stageSwitchPrompts.command.unknown,
+              text: formatPrompt(this.prompts.command.unknown,
                 { target: target ?? '', stages: this.stageNames }),
             }
           }
@@ -634,10 +741,10 @@ export class StageController extends Service {
           return {
             kind: 'success',
             text: alreadyCurrent
-              ? formatPrompt(stageSwitchPrompts.command.alreadyCurrent, { target })
+              ? formatPrompt(this.prompts.command.alreadyCurrent, { target })
               : outcome === 'committed'
-                ? formatPrompt(stageSwitchPrompts.command.switched, { target })
-                : formatPrompt(stageSwitchPrompts.command.queued, { target }),
+                ? formatPrompt(this.prompts.command.switched, { target })
+                : formatPrompt(this.prompts.command.queued, { target }),
           }
         },
       })
@@ -647,6 +754,20 @@ export class StageController extends Service {
   /** The configured stage names, sorted for stable diagnostics. */
   private get stageNames(): string {
     return [...this.instructionByStage.keys()].sort().join(', ')
+  }
+
+  /**
+   * The session's `stage` projection state. The unit is registered for the
+   * service's whole lifetime, so an absent key means the registry lost the
+   * registration (a reload race): the projection seam's mandatory-reader
+   * rule — fail loud, never degrade to a default.
+   */
+  private projectionOf(session: Session): StageProjectionState {
+    const state = this.ctx.sessionProjections.stateOf(session, 'stage')
+    if (state === undefined) {
+      throw new Error('dsh-stage-switch: the stage projection unit is not registered')
+    }
+    return state
   }
 
   /**
@@ -679,7 +800,7 @@ export class StageController extends Service {
    * @returns The stage in force.
    */
   current(session: Session): string {
-    return foldStage(session.snapshotEvents()) ?? this.initial
+    return this.projectionOf(session).stage ?? this.initial
   }
 
   /**
@@ -697,7 +818,7 @@ export class StageController extends Service {
   set(agent: Agent, stage: string): 'committed' | 'queued' | 'noop' {
     const session = agent.session
     if (stage === this.current(session)) return 'noop'
-    if (hasOpenTurn(session.snapshotEvents())) {
+    if (this.projectionOf(session).openTurn) {
       this.pendingTransitions.set(session, { stage, handoffPath: undefined, narrate: true })
       return 'queued'
     }
@@ -717,7 +838,7 @@ export class StageController extends Service {
   private shouldNarrate(session: Session, stage: string): boolean {
     // Before the first stage record the model was told the initial stage, so
     // the header-stage fold falls back to it.
-    return (stageAtLastHeader(session.snapshotEvents()) ?? this.initial) !== stage
+    return (this.projectionOf(session).stageAtLastHeader ?? this.initial) !== stage
   }
 
   /**
@@ -731,11 +852,8 @@ export class StageController extends Service {
    * @returns The stage prompt message.
    */
   private stagePromptMessage(stage: string, narrate: boolean): UserMessage {
-    const instruction = this.instructionByStage.get(stage)
-    const body = instruction === undefined
-      ? `Current stage: ${stage}`
-      : `Current stage: ${stage}\n${instruction}`
-    const text = narrate ? formatPrompt(stageSwitchPrompts.notice.userSwitchPrefix, { stage }) + body : body
+    const body = this.stagePromptText(stage)
+    const text = narrate ? formatPrompt(this.prompts.notice.userSwitchPrefix, { stage }) + body : body
     return createUserMessage({
       content: [{ type: 'text', text }],
       // The summary is the short account a UI can show on a collapsed row.
@@ -763,7 +881,7 @@ export class StageController extends Service {
     if (this.minHandoffTokens === undefined) return true
     const meter: TokenMeter | undefined = this.ctx.get('tokenMeter')
     if (meter === undefined) {
-      throw new Error(stageSwitchPrompts.errors.missingTokenMeter)
+      throw new Error(this.prompts.errors.missingTokenMeter)
     }
     return meter.measure(session).surfaceTokens >= this.minHandoffTokens
   }
@@ -788,7 +906,7 @@ export class StageController extends Service {
   ): Promise<string> {
     const fs: FileSystem | undefined = this.ctx.get('fs')
     if (fs === undefined) {
-      throw new Error(stageSwitchPrompts.errors.noFs)
+      throw new Error(this.prompts.errors.noFs)
     }
     const cwd = agent.session.header.cwd
     const relative = `${this.handoffDir}/${sessionSegment(agent.session.id)}/${stage}.md`
@@ -829,7 +947,7 @@ export class StageController extends Service {
    */
   private replaceWithHandoffNotice(session: Session, stage: string, handoffPath: string): void {
     const nodes = [...session.surface.nodes]
-    const text = `${formatPrompt(stageSwitchPrompts.notice.handoffReplaced, { stage, path: handoffPath })}\n\n${this.stagePromptText(stage)}`
+    const text = `${formatPrompt(this.prompts.notice.handoffReplaced, { stage, path: handoffPath })}\n\n${this.stagePromptText(stage)}`
     const message = createUserMessage({
       content: [{ type: 'text', text }],
       // The summary is the short account a UI can show on a collapsed row.
@@ -870,8 +988,7 @@ export class StageController extends Service {
   private surfaceShadowRange(session: Session, nodes: readonly SessionSeq[]): SessionSeq[] {
     const head = nodes[0]
     if (head === undefined) return []
-    const headEvent = session.snapshotEvents().find(event => event.seq === head)
-    return headEvent?.type === 'system/message' ? nodes.slice(1) : [...nodes]
+    return this.projectionOf(session).headIsSystem ? nodes.slice(1) : [...nodes]
   }
 
   /** The stage-prompt body text for one stage (instruction when configured). */
