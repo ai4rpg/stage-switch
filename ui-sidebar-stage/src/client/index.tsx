@@ -15,11 +15,14 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
-import { STAGE_ID, stageDefinition } from './definition.tsx'
+import { STAGE_ID, STAGE_KIND, stageDefinition } from './definition.tsx'
 import { StageBody } from './StageBody.tsx'
+import { StageTitle } from './StageTitle.tsx'
+import { StageDock } from './StageDock.tsx'
 import { createStageSource } from './store.ts'
 import { createStageSwitcher } from './switch.ts'
 import { en, NS, zh } from './locales.ts'
+import { installStageStyles } from './styles.ts'
 
 export type { StageRecord } from './fold.ts'
 export type { StageView } from './store.ts'
@@ -27,7 +30,7 @@ export type { StageBodyProps } from './StageBody.tsx'
 export type { StageSwitchOutcome } from './switch.ts'
 
 /** Required browser services: the tab registry, the slots seat, the session bindings, and copy. */
-export const inject = ['slots', 'locale', 'sidebarRightTabs', 'sessions']
+export const inject = ['slots', 'locale', 'sidebarRightTabs', 'sidebarRight', 'sessions']
 
 /**
  * Client plugin body: register the type, its dictionaries, and its body seat.
@@ -36,6 +39,7 @@ export const inject = ['slots', 'locale', 'sidebarRightTabs', 'sessions']
 export function apply(ctx: ClientContext): void {
   const t = ctx.locale.bind(NS)
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-sidebar-stage: dictionaries')
+  ctx.effect(() => installStageStyles(), 'ui-sidebar-stage: styles')
   ctx.effect(() => ctx.sidebarRightTabs.register(stageDefinition(t)), 'ui-sidebar-stage: stage type')
   const sessions = ctx.sessions
   ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register(
@@ -50,4 +54,24 @@ export function apply(ctx: ClientContext): void {
     },
     StageBody,
   )), 'ui-sidebar-stage: stage tab body')
+  ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab.title', () => ctx.slots.register(
+    {
+      name: 'sidebar.right.pane.tab.title',
+      key: STAGE_ID,
+      locale: NS,
+    },
+    StageTitle,
+  )), 'ui-sidebar-stage: live tab title')
+  ctx.effect(() => ctx.slots.inject('conversation.input.dock', () => ctx.slots.register(
+    {
+      name: 'conversation.input.dock',
+      id: STAGE_KIND,
+      order: 20,
+      locale: NS,
+      inject: (sessionId: SessionId) => ({
+        openStage: () => { ctx.sidebarRight.openTabIn(sessionId, STAGE_KIND) },
+      }),
+    },
+    StageDock,
+  )), 'ui-sidebar-stage: composer dock')
 }

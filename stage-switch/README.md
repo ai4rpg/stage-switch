@@ -1,15 +1,17 @@
 # @ai4rpg/dsh-stage-switch
 
-Standalone repository for `@ai4rpg/dsh-stage-switch`, an optional stage-collaboration plugin developed for the DeepSeek Harness agent harness ([deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)). The design decision record is [docs/DESIGN.md](docs/DESIGN.md).
+`@ai4rpg/dsh-stage-switch` is an optional stage-collaboration plugin developed for the DeepSeek Harness agent harness ([deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)). The design decision record is [docs/DESIGN.md](docs/DESIGN.md).
 
 English | [中文](README.zh.md)
 
-Logged, per-agent stage collaboration state with deployment-owned stage instructions, an eligibility seam that gates switch guidance, a handoff document written to the workspace, and a user-reviewed `goto_stage` transition that archives the model-visible history on approval.
+The plugin keeps logged, per-agent stage collaboration state with deployment-owned stage instructions, an eligibility seam that gates switch guidance, a handoff document written to the workspace, and a user-reviewed `goto_stage` transition that archives the model-visible history on approval.
 
 ## Durable state
 
 The stage record rides the stage-switch plugin message every stage entry appends — the stage prompt (`Current stage: <name>`) or the handoff notice (`Stage switched to <name>`), both plain `user/message` events the stock harness event catalog already knows. Each record's source is producer-owned: `kind: 'stage-switch'` with the `notice` form and its summary. Records written by earlier releases come back from the harness's V3→V4 session conversion as `plugin:stage-switch`; `foldStage` accepts both kinds, so a resumed old session still lands on its recorded stage. `foldStage(events)` returns the stage from the last record (either notice shape) or `undefined`; the service folds to the configured `initial` stage (default the first stage) before the first record, so resume, fork, and compaction recover the stage directly from the session log. UIs observe committed switches through `session/event`.
-Reads go through the `stage` session-projection unit the service registers on `ctx.sessionProjections` (a required injection): the framework drives the same per-event fold over committed events and checkpoints the state, so every read costs O(new events) instead of a whole-log scan — the harness deprecated the synchronous whole-log readers, and this package makes zero calls to them. The unit is host-only (no client wire view); the sidebar client package keeps folding the durable records itself.
+
+Reads go through the `stage` session-projection unit the service registers on `ctx.sessionProjections` (a required injection): the framework drives the same per-event fold over committed events and checkpoints the state, so every read costs O(new events) instead of a whole-log scan — the harness deprecated the synchronous whole-log readers, and this package makes zero calls to them. The unit's host state drives every service read; its `wire` view publishes the client-visible stage value — the configured catalog with instructions and optional display aliases, the recorded journey, and per-stage message/tool/token/error counters — so a client can render the journey without rescanning the log. The projection key is runtime-global (a deployment may mount this plugin from an agent preset, which makes the key visible to every session), so the sidebar stage tab treats the session's own durable stage record as the activation gate: it prefers the wire value once a record exists and otherwise keeps its own fold fallback (another preset's session, or a session before its first accepted step).
+
 `ctx.stage.current(session)` reads the stage in force. A reviewed transition is held pending and applied at the next accepted in-turn pre-step, so the current tool batch keeps its stage context and the tool result itself narrates the switch.
 
 ## Eligibility seam
@@ -46,10 +48,13 @@ The next accepted in-turn pre-step appends the target stage's prompt message —
   config:
     stages:
       - name: explore
+        alias: 探索
         instruction: Explore the problem space and present a plan.
       - name: implement
+        alias: 实现
         instruction: Implement the approved plan.
       - name: verify
+        alias: 验证
         instruction: Verify the implementation with tests.
     section: |
       The current stage is complete. Call goto_stage to switch to a later
@@ -60,9 +65,11 @@ The next accepted in-turn pre-step appends the target stage's prompt message —
     minHandoffTokens: 4000
 ```
 
-`stages` is required, non-empty, and name-unique; names must match `[a-z][a-z0-9_-]*` so handoff file names stay safe. Each handoff document lands in `<handoffDir>/<session id>/<stage>.md` under the session cwd — the per-session directory keeps sessions that share a workspace from overwriting each other's documents. `section` is required and non-empty. `handoffDir` defaults to `handoff`; `initial` defaults to the first stage and must name a configured stage; `minHandoffTokens` is optional and must be non-negative; `language` selects the review-dialog language — `en` (default) or `zh`, the Chinese review-dialog dictionary (see below). Unknown keys fail at load.
+`stages` is required, non-empty, and name-unique; names must match `[a-z][a-z0-9_-]*` so handoff file names stay safe. A stage may also declare an optional `alias` — a display label such as a localization, at most 60 characters. The alias is display-only: `name` stays the durable identity in the log, `/stage`, `goto_stage`, and every model-facing surface, while the alias rides the client wire view so the sidebar tab and its ambient surfaces can show the localized label. Each handoff document lands in `<handoffDir>/<session id>/<stage>.md` under the session cwd — the per-session directory keeps sessions that share a workspace from overwriting each other's documents. `section` is required and non-empty. `handoffDir` defaults to `handoff`; `initial` defaults to the first stage and must name a configured stage; `minHandoffTokens` is optional and must be non-negative; `language` selects the review-dialog language — `en` (default) or `zh`, the Chinese review-dialog dictionary (see below). Unknown keys fail at load.
 
 A configured `minHandoffTokens` requires `@deepseek-ai/dsh-token-meter` in the composition; a `goto_stage` call fails loud when it is missing. The service also requires `@deepseek-ai/dsh-session-projection` for its projection-backed reads — the harness's base bundle mounts it, so standard compositions already provide it; activation fails loud without it.
+
+The package declares `engines.dsh` (`>=0.2.0-rc.2 <0.3.0-0`) as its DSH compatibility gate. DSH's app-boot and plugin-manager prefer that range over the dsh `peerDependencies`; the peers remain in the manifest because the Loader's profile resolution uses their names to route this plugin's host-package imports to the installation copy. The dsh peer ranges accept both the 0.2.0 line and the 0.2.1 prerelease line, so a host on either line passes npm's peer check. The engine range is the compatibility source, not the peer ranges; a dsh installation outside it is unsupported.
 
 ## Prompt copy
 
@@ -70,7 +77,7 @@ All user-facing copy this package ships — the `goto_stage` tool description an
 
 Templates may reference `{name}` placeholders, interpolated by `formatPrompt` — e.g. `review.fullQuestion: "Approve switching to stage \"{stage}\" and archiving the conversation?"`.
 
-Deliberately **not** in prompts.json — the load-bearing formats the fold and prompt-injection paths parse:
+The load-bearing formats below are deliberately **not** in prompts.json, because the fold and prompt-injection paths parse them:
 
 - the stage-prompt body prefix `Current stage: <name>` (the narrator prefix *"The user switched this session to stage …"* IS editable copy);
 - the `source.summary` notice shapes (`Current stage: <name>` / `Stage switched to <name>`);
@@ -87,14 +94,9 @@ Edit `src/prompts.json` directly, then `npm run build` (the `prebuild` script re
 
 ### Chinese review-dialog strings
 
-The package ships a Chinese overlay for the `review.*` dialog strings
-(`src/prompts.zh.json`, 8 keys); all other user-facing copy (tool
-descriptions, notices, error messages, command texts) stays English.
+The package ships a Chinese overlay for the `review.*` dialog strings (`src/prompts.zh.json`, 8 keys); all other user-facing copy (tool descriptions, notices, error messages, command texts) stays English.
 
-**The deployment-declared route (preferred):** set `language: zh` on the
-plugin row — the service resolves the Chinese dictionary at construction, so
-the choice lives in the composition (the same patch that mounts the plugin),
-survives every reinstall, and needs no post-install script:
+**Prefer the deployment-declared route:** set `language: zh` on the plugin row — the service resolves the Chinese dictionary at construction, so the choice lives in the composition (the same patch that mounts the plugin), survives every reinstall, and needs no post-install script:
 
 ```yaml
 - id: stage-switch
@@ -104,20 +106,13 @@ survives every reinstall, and needs no post-install script:
     # ...stages, section, and the rest
 ```
 
-**The file-level route (legacy):** merge the overlay into the installed copy
-instead — useful where the composition cannot be edited:
+**Use the file-level route (legacy) only when the composition cannot be edited:** merge the overlay into the installed copy instead:
 
 ```sh
 node node_modules/@ai4rpg/dsh-stage-switch/scripts/apply-zh.mjs
 ```
 
-This deep-merges the Chinese review strings over the installed
-`src/prompts.json`. The embedded fallback (`lib/prompts.defaults.js`) is
-unchanged — a stale install that loses the JSON still falls back to English.
-To revert the file-level merge: reinstall the package (`dsh plugin remove +
-add`), which restores the English `src/prompts.json`. **Re-run the script
-after every reinstall or upgrade** that resets the installed copy — or switch
-to the config route, which has no such step.
+This deep-merges the Chinese review strings over the installed `src/prompts.json`. The embedded fallback (`lib/prompts.defaults.js`) is unchanged — a stale install that loses the JSON still falls back to English. To revert the file-level merge: reinstall the package (`dsh plugin remove + add`), which restores the English `src/prompts.json`. **Re-run the script after every reinstall or upgrade** that resets the installed copy — or switch to the config route, which has no such step.
 
 ## Model Experience
 

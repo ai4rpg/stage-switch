@@ -1,202 +1,294 @@
 // @vitest-environment jsdom
 /**
- * The body: the current stage as a switch dropdown over the recorded stages,
- * the transition history in log order, and the empty state before the first
- * record.
+ * The Atlas stage tab: the preferred Host projection wire view, the fold
+ * fallback for sessions without the capability, the journey rows, the
+ * command palette, and the honest pending/failure states.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createElement } from 'react'
 import { act, cleanup, fireEvent, render } from '@testing-library/react'
-import { makeTranslate, STAGE_NAMES } from './helpers.ts'
+import { makeTranslate, STAGE_ALIASES, STAGE_NAMES } from './helpers.ts'
 import { StageBody } from '../src/client/StageBody.tsx'
 import type { StageView } from '../src/client/store.ts'
+import type { StageRecord } from '../src/client/fold.ts'
+import type { StageWireView } from '../src/client/wire.ts'
 import type { StageSwitchOutcome } from '../src/client/switch.ts'
 import { zh } from '../src/client/locales.ts'
 
 const t = makeTranslate(zh)
+const NOW = 1_700_000_000_000
 
 afterEach(cleanup)
 
-function bodyOf(view: StageView, switchStage: (stage: string) => Promise<StageSwitchOutcome> = () => Promise.resolve({ ok: true })) {
-  const useStage = <T,>(selector: (state: StageView) => T): T => selector(view)
-  return render(createElement(StageBody, { useStage, switchStage, t } as never))
+/** One fold record with the Atlas metrics. */
+function record(
+  stage: string,
+  seq: number,
+  switched: boolean,
+  time = NOW - 60_000,
+  metrics: Partial<Pick<StageRecord, 'messages' | 'tools' | 'tokens' | 'errors' | 'instruction'>> = {},
+): StageRecord {
+  return {
+    stage,
+    seq,
+    time,
+    switched,
+    instruction: metrics.instruction ?? `Do ${stage}.`,
+    messages: metrics.messages ?? 0,
+    tools: metrics.tools ?? 0,
+    tokens: metrics.tokens ?? 0,
+    errors: metrics.errors ?? 0,
+  }
 }
 
-/** The option rows of the open dropdown, in list order. */
-function optionsOf(container: HTMLElement): HTMLButtonElement[] {
-  return [...container.querySelectorAll<HTMLButtonElement>('[data-stage-menu] [role="option"]')]
+/** The configured catalog used by the wire fixtures; two stages carry an alias. */
+const CATALOG = [
+  { name: STAGE_NAMES.first, instruction: `Do ${STAGE_NAMES.first}.` },
+  { name: STAGE_NAMES.second, alias: STAGE_ALIASES.second, instruction: `Do ${STAGE_NAMES.second}.` },
+  { name: STAGE_NAMES.third, alias: STAGE_ALIASES.third, instruction: `Do ${STAGE_NAMES.third}.` },
+  { name: STAGE_NAMES.target, instruction: `Do ${STAGE_NAMES.target}.` },
+]
+
+/** A wire view with the current stage second and two future stages. */
+function wireView(): StageWireView {
+  return {
+    stage: STAGE_NAMES.second,
+    stages: CATALOG,
+    history: [
+      { stage: STAGE_NAMES.first, seq: 1, time: NOW - 900_000, switched: false, messages: 4, tools: 2, tokens: 800, errors: 0 },
+      { stage: STAGE_NAMES.second, seq: 2, time: NOW - 60_000, switched: true, messages: 3, tools: 2, tokens: 1_200, errors: 0 },
+    ],
+    historyTruncated: false,
+  }
+}
+
+/** The fold fallback view: only visited stages, no catalog. */
+function foldView(): StageView {
+  return {
+    current: STAGE_NAMES.second,
+    records: [
+      record(STAGE_NAMES.first, 1, false, NOW - 900_000, { messages: 4, tools: 2 }),
+      record(STAGE_NAMES.second, 2, true, NOW - 60_000, { messages: 3, tools: 2 }),
+    ],
+  }
+}
+
+interface BodyOptions {
+  readonly view?: StageView
+  readonly wire?: StageWireView
+  readonly running?: boolean
+  readonly hasMore?: boolean
+  readonly switchStage?: (stage: string) => Promise<StageSwitchOutcome>
+}
+
+/** Render the body with mocked slot hooks. */
+function bodyOf(options: BodyOptions = {}) {
+  const view = options.view ?? { current: undefined, records: [] }
+  const wire = options.wire
+  const useStage = <T,>(selector: (state: StageView) => T): T => selector(view)
+  const useProjection = (key: string): unknown => key === 'stage' ? wire : undefined
+  const useSession = <T,>(selector: (state: { running: boolean, hasMore: boolean }) => T): T =>
+    selector({ running: options.running ?? true, hasMore: options.hasMore ?? false })
+  return render(createElement(StageBody, {
+    useStage,
+    useProjection,
+    useSession,
+    switchStage: options.switchStage ?? (() => Promise.resolve({ ok: true } as StageSwitchOutcome)),
+    t,
+  } as never))
+}
+
+/** Open the palette through the switch button. */
+async function openPalette(container: HTMLElement): Promise<void> {
+  await act(async () => {
+    fireEvent.click(container.querySelector('[data-stage-switch]')!)
+  })
 }
 
 describe('StageBody', () => {
-  it('renders the empty state before the first record', () => {
-    const { container } = bodyOf({ current: undefined, records: [] })
-    expect(container.querySelector('[data-stage-empty]')?.textContent).toBe(zh.empty)
-    // No records means no stage to show or offer in the dropdown.
+  it('renders the empty state and lets a typed stage name start from nothing', async () => {
+    const switchStage = vi.fn(() => Promise.resolve({ ok: true } as StageSwitchOutcome))
+    const { container } = bodyOf({ switchStage })
+    expect(container.querySelector('[data-stage-empty]')?.textContent).toContain(zh.emptyTitle)
+    expect(container.querySelector('[data-stage-current]')).toBeNull()
+
+    await act(async () => {
+      fireEvent.click(container.querySelector('.ui-stage-empty-action')!)
+    })
+    const input = container.querySelector<HTMLInputElement>('.ui-stage-search-input')!
+    await act(async () => {
+      fireEvent.change(input, { target: { value: STAGE_NAMES.target } })
+    })
+    const custom = container.querySelector(`[data-stage-option="${STAGE_NAMES.target}"]`)
+    expect(custom?.textContent).toContain(zh.custom)
+    await act(async () => {
+      fireEvent.click(custom!)
+    })
+    expect(switchStage).toHaveBeenCalledWith(STAGE_NAMES.target)
+    expect(container.querySelector('[data-stage-menu]')).toBeNull()
+  })
+
+  it('treats a wire without a durable stage record as absent', () => {
+    // The projection key is runtime-global: another preset's session (or this
+    // session before its first accepted step) carries a wire with no record.
+    const fresh: StageWireView = {
+      stage: STAGE_NAMES.first,
+      stages: CATALOG,
+      history: [],
+      historyTruncated: false,
+    }
+    const { container } = bodyOf({ wire: fresh })
+    expect(container.querySelector('[data-stage-empty]')).not.toBeNull()
     expect(container.querySelector('[data-stage-current]')).toBeNull()
   })
 
-  it('follows the pane\'s official visual language: gutter, capsule, and the live record\'s accent', () => {
-    // The pane's scroller insets nothing (verified against the live pane
-    // chain), so the body insets itself. The current stage rides the guide
-    // tab's capsule shape on alias tokens (theme-aware without an override),
-    // and the history's live record is the only row on the business accent.
-    const empty = render(createElement(StageBody, {
-      useStage: <T, >(selector: (state: StageView) => T): T => selector({ current: undefined, records: [] }),
-      switchStage: () => Promise.resolve({ ok: true }),
-      t,
-    } as never)).container
-    expect(empty.querySelector<HTMLElement>('[data-stage-empty]')?.style.margin).toBe('0px')
+  it('renders the Host wire view: hero, live metrics, visited journey, and future nodes', () => {
+    const { container } = bodyOf({ wire: wireView() })
+    const hero = container.querySelector<HTMLElement>('[data-stage-current]')
+    // The hero shows the display alias; the durable name stays on the node
+    // (and in the tooltip) because it is the switch target and log identity.
+    expect(hero?.textContent).toBe(STAGE_ALIASES.second)
+    expect(hero?.getAttribute('data-stage-name')).toBe(STAGE_NAMES.second)
+    expect(hero?.getAttribute('title')).toBe(STAGE_NAMES.second)
+    expect(container.querySelector('.ui-stage-brief')?.textContent).toBe(`Do ${STAGE_NAMES.second}.`)
+    expect(container.querySelector('.ui-stage-live')?.textContent).toContain(zh.live)
+    expect(container.querySelector('.ui-stage-ring-index')?.textContent).toBe('02')
+    expect(container.querySelector('.ui-stage-ring-total')?.textContent).toBe('/ 04')
 
-    const { container } = bodyOf({
-      current: STAGE_NAMES.second,
-      records: [
-        { stage: STAGE_NAMES.first, seq: 1, time: 0, switched: false },
-        { stage: STAGE_NAMES.second, seq: 2, time: 0, switched: true },
-      ],
-    })
-    const section = container.querySelector<HTMLElement>('[data-stage-tab]')
-    // jsdom normalizes the shorthand to its four-value form.
-    expect(section?.style.padding).toBe('16px 16px 24px 16px')
-    const trigger = container.querySelector<HTMLButtonElement>('[data-stage-current]')
-    expect(trigger?.style.background).toBe('var(--dsw-alias-bg-layer-1)')
-    expect(trigger?.style.borderRadius).toBe('var(--dsw-radius-xl)')
-    expect(trigger?.style.border).toContain('var(--dsw-alias-border-l3)')
-    const dots = [...container.querySelectorAll<HTMLSpanElement>('[data-stage-history] li > span[aria-hidden]')]
-    expect(dots).toHaveLength(2)
-    expect(dots[0]?.style.background).toBe('var(--dsw-alias-border-l3)')
-    expect(dots[1]?.style.background).toBe('var(--dsw-alias-state-business-primary)')
+    const values = [...container.querySelectorAll('.ui-stage-metric-value')].map(node => node.textContent)
+    expect(values).toEqual(['3', '2', '1.2k'])
+
+    const rows = [...container.querySelectorAll('[data-stage-history] li')]
+    expect(rows).toHaveLength(4)
+    expect(rows[0]?.textContent).toContain(STAGE_NAMES.first)
+    expect(rows[1]?.textContent).toContain(STAGE_ALIASES.second)
+    expect(rows[1]?.textContent).not.toContain(STAGE_NAMES.second)
+    expect(rows[1]?.textContent).toContain(zh.now)
+    expect(rows[1]?.getAttribute('aria-current')).toBe('step')
+    expect(rows[2]?.textContent).toContain(STAGE_ALIASES.third)
+    expect(rows[2]?.textContent).toContain(zh.notVisited)
+    expect(rows[3]?.textContent).toContain(zh.notVisited)
+    expect(container.querySelector('.ui-stage-section-count')?.textContent).toBe('2 / 4')
   })
 
-  it('renders the current stage on the trigger and the history in log order', () => {
-    const { container } = bodyOf({
-      current: STAGE_NAMES.second,
-      records: [
-        { stage: STAGE_NAMES.first, seq: 1, time: 0, switched: false },
-        { stage: STAGE_NAMES.second, seq: 2, time: 0, switched: true },
-      ],
-    })
-    // The chevron glyph contributes no text, so the trigger's text is the stage.
+  it('falls back to the client fold: visited only, with the partial-history note', () => {
+    const { container } = bodyOf({ view: foldView(), hasMore: true })
     expect(container.querySelector('[data-stage-current]')?.textContent).toBe(STAGE_NAMES.second)
-    const items = [...container.querySelectorAll('[data-stage-history] li')].map(item => item.textContent)
-    expect(items).toEqual([`${zh.entered} ${STAGE_NAMES.first}`, `${zh.switched} ${STAGE_NAMES.second}`])
+    const rows = [...container.querySelectorAll('[data-stage-history] li')]
+    expect(rows).toHaveLength(2)
+    expect(rows[0]?.textContent).toContain(STAGE_NAMES.first)
+    expect(rows[1]?.textContent).toContain(STAGE_NAMES.second)
+    expect(container.querySelector('.ui-stage-section-count')?.textContent)
+      .toBe(t('visitedCount', { count: 2 }))
+    expect(container.querySelector('.ui-stage-note')?.textContent).toBe(zh.historyPartial)
   })
 
-  it('opens the dropdown on the trigger and offers the recorded stages, the current selected', async () => {
-    const { container } = bodyOf({
-      current: STAGE_NAMES.first,
-      records: [
-        { stage: STAGE_NAMES.first, seq: 1, time: 0, switched: false },
-        { stage: STAGE_NAMES.second, seq: 2, time: 0, switched: true },
-        { stage: STAGE_NAMES.first, seq: 3, time: 0, switched: true },
-      ],
-    })
-    const trigger = container.querySelector<HTMLButtonElement>('[data-stage-current]')!
-    expect(container.querySelector('[data-stage-menu]')).toBeNull()
-    await act(async () => {
-      fireEvent.click(trigger)
-    })
-    // The distinct recorded stages in first-record order, the current row
-    // marked selected with the trailing check.
-    const options = optionsOf(container)
-    expect(options.map(option => option.textContent)).toEqual([STAGE_NAMES.first, STAGE_NAMES.second])
-    expect(options[0]?.getAttribute('aria-selected')).toBe('true')
-    expect(options[0]?.querySelector('svg')).not.toBeNull()
-    expect(options[1]?.getAttribute('aria-selected')).toBe('false')
-    // The menu card rides the official surface tokens.
-    const menu = container.querySelector<HTMLElement>('[data-stage-menu]')!
-    expect(menu.style.borderRadius).toBe('var(--dsw-radius-lg)')
-    expect(menu.style.background).toBe('var(--dsw-menu-surface-fill)')
-  })
-
-  it('closes on Escape, on an outside pointerdown, and on a row pick', async () => {
+  it('opens the palette with the full route, marks the current stage, and switches a pick', async () => {
     const switchStage = vi.fn(() => Promise.resolve({ ok: true } as StageSwitchOutcome))
-    const { container } = bodyOf({
-      current: STAGE_NAMES.second,
-      records: [
-        { stage: STAGE_NAMES.first, seq: 1, time: 0, switched: false },
-        { stage: STAGE_NAMES.second, seq: 2, time: 0, switched: true },
-      ],
-    }, switchStage)
-    const trigger = container.querySelector<HTMLButtonElement>('[data-stage-current]')!
-
+    const { container } = bodyOf({ wire: wireView(), switchStage })
+    await openPalette(container)
+    const options = [...container.querySelectorAll<HTMLButtonElement>('[data-stage-option]')]
+    expect(options.map(option => option.getAttribute('data-stage-option')))
+      .toEqual([STAGE_NAMES.first, STAGE_NAMES.second, STAGE_NAMES.third, STAGE_NAMES.target])
+    // Aliased rows show the label plus the durable name as a hint; the data
+    // attribute (the switch target) stays the name.
+    expect(options[1]?.textContent).toContain(STAGE_ALIASES.second)
+    expect(options[1]?.querySelector('.ui-stage-option-hint')?.textContent).toBe(STAGE_NAMES.second)
+    expect(options[1]?.textContent).toContain(zh.now)
+    expect(options[2]?.textContent).toContain(STAGE_ALIASES.third)
+    expect(options[2]?.querySelector('.ui-stage-option-hint')?.textContent).toBe(STAGE_NAMES.third)
+    expect(options[2]?.textContent).toContain(zh.notVisited)
+    // The current stage is inert; another row submits the command.
     await act(async () => {
-      fireEvent.click(trigger)
+      fireEvent.click(options[1]!)
     })
+    expect(switchStage).not.toHaveBeenCalled()
+    await openPalette(container)
     await act(async () => {
-      fireEvent.keyDown(document, { key: 'Escape' })
+      fireEvent.click(container.querySelector(`[data-stage-option="${STAGE_NAMES.third}"]`)!)
     })
+    expect(switchStage).toHaveBeenCalledWith(STAGE_NAMES.third)
     expect(container.querySelector('[data-stage-menu]')).toBeNull()
-
-    await act(async () => {
-      fireEvent.click(trigger)
-    })
-    await act(async () => {
-      fireEvent.pointerDown(document.body)
-    })
-    expect(container.querySelector('[data-stage-menu]')).toBeNull()
-
-    await act(async () => {
-      fireEvent.click(trigger)
-    })
-    // The row for the stage already in force is inert, so the pick targets an
-    // unselected row.
-    const row = optionsOf(container)[0]!
-    await act(async () => {
-      fireEvent.click(row)
-    })
-    expect(container.querySelector('[data-stage-menu]')).toBeNull()
-    expect(switchStage).toHaveBeenCalledWith(STAGE_NAMES.first)
   })
 
-  it('locks the trigger while a switch runs and parks back on the stage in force', async () => {
-    let resolveSwitch: (outcome: StageSwitchOutcome) => void = () => {}
-    const switchStage = vi.fn(() => new Promise<StageSwitchOutcome>(resolve => { resolveSwitch = resolve }))
-    const { container } = bodyOf({
-      current: STAGE_NAMES.second,
-      records: [
-        { stage: STAGE_NAMES.first, seq: 1, time: 0, switched: false },
-        { stage: STAGE_NAMES.second, seq: 2, time: 0, switched: true },
-      ],
-    }, switchStage)
-    const trigger = container.querySelector<HTMLButtonElement>('[data-stage-current]')!
+  it('filters the palette by display alias and still submits the durable name', async () => {
+    const switchStage = vi.fn(() => Promise.resolve({ ok: true } as StageSwitchOutcome))
+    const { container } = bodyOf({ wire: wireView(), switchStage })
+    await openPalette(container)
+    const input = container.querySelector<HTMLInputElement>('.ui-stage-search-input')!
     await act(async () => {
-      fireEvent.click(trigger)
+      fireEvent.change(input, { target: { value: STAGE_ALIASES.third } })
     })
+    const options = [...container.querySelectorAll<HTMLButtonElement>('[data-stage-option]')]
+    expect(options.map(option => option.getAttribute('data-stage-option'))).toEqual([STAGE_NAMES.third])
     await act(async () => {
-      fireEvent.click(optionsOf(container)[0]!)
+      fireEvent.click(options[0]!)
     })
-    expect(switchStage).toHaveBeenCalledWith(STAGE_NAMES.first)
-    // The pick is held (and the control locked) until the command settles.
-    expect(trigger.disabled).toBe(true)
-    await act(async () => {
-      resolveSwitch({ ok: true })
-    })
-    // The static test view still folds the old current, so the trigger parks
-    // back on it — the live fold takes over in a real session.
-    expect(trigger.disabled).toBe(false)
-    expect(trigger.textContent).toBe(STAGE_NAMES.second)
-    expect(container.querySelector('[data-stage-failure]')).toBeNull()
+    expect(switchStage).toHaveBeenCalledWith(STAGE_NAMES.third)
   })
 
-  it('shows the failure line and parks back on the stage in force when the switch fails', async () => {
-    const switchStage = vi.fn(() => Promise.resolve({ ok: false, reason: 'unavailable' } as StageSwitchOutcome))
-    const { container } = bodyOf({
-      current: STAGE_NAMES.second,
-      records: [
-        { stage: STAGE_NAMES.first, seq: 1, time: 0, switched: false },
-        { stage: STAGE_NAMES.second, seq: 2, time: 0, switched: true },
-      ],
-    }, switchStage)
-    const trigger = container.querySelector<HTMLButtonElement>('[data-stage-current]')!
+  it('switches directly from a journey row and shows the requested note while the record is queued', async () => {
+    let resolve: (outcome: StageSwitchOutcome) => void = () => {}
+    const switchStage = vi.fn(() => new Promise<StageSwitchOutcome>((done) => { resolve = done }))
+    const { container } = bodyOf({ wire: wireView(), switchStage })
+    const past = container.querySelector<HTMLButtonElement>(`[data-stage-history] button[aria-label="${zh.switchTo} ${STAGE_NAMES.first}"]`)!
     await act(async () => {
-      fireEvent.click(trigger)
-    })
-    await act(async () => {
-      fireEvent.click(optionsOf(container)[0]!)
+      fireEvent.click(past)
     })
     expect(switchStage).toHaveBeenCalledWith(STAGE_NAMES.first)
-    expect(container.querySelector('[data-stage-failure]')?.textContent).toBe(zh.switchUnavailable)
-    expect(trigger.textContent).toBe(STAGE_NAMES.second)
-    expect(trigger.disabled).toBe(false)
+    expect(container.querySelector<HTMLButtonElement>('[data-stage-switch]')?.disabled).toBe(true)
+    await act(async () => {
+      resolve({ ok: true })
+    })
+    expect(container.querySelector('.ui-stage-requested')?.textContent)
+      .toBe(t('requested', { stage: STAGE_NAMES.first }))
+    expect(container.querySelector<HTMLButtonElement>('[data-stage-switch]')?.disabled).toBe(false)
+  })
+
+  it('names a queued switch by its display alias', async () => {
+    let resolve: (outcome: StageSwitchOutcome) => void = () => {}
+    const switchStage = vi.fn(() => new Promise<StageSwitchOutcome>((done) => { resolve = done }))
+    const { container } = bodyOf({ wire: wireView(), switchStage })
+    const future = container.querySelector<HTMLButtonElement>(
+      `[data-stage-history] button[aria-label="${zh.switchTo} ${STAGE_ALIASES.third}"]`,
+    )!
+    await act(async () => {
+      fireEvent.click(future)
+    })
+    expect(switchStage).toHaveBeenCalledWith(STAGE_NAMES.third)
+    await act(async () => {
+      resolve({ ok: true })
+    })
+    expect(container.querySelector('.ui-stage-requested')?.textContent)
+      .toBe(t('requested', { stage: STAGE_ALIASES.third }))
+  })
+
+  it('shows a failed switch with the command message and clears the pending lock', async () => {
+    const switchStage = vi.fn(() => Promise.resolve({
+      ok: false,
+      reason: 'failed',
+      message: 'unknown stage',
+    } as StageSwitchOutcome))
+    const { container } = bodyOf({ wire: wireView(), switchStage })
+    const past = container.querySelector<HTMLButtonElement>(`[data-stage-history] button[aria-label="${zh.switchTo} ${STAGE_NAMES.first}"]`)!
+    await act(async () => {
+      fireEvent.click(past)
+    })
+    expect(container.querySelector('[data-stage-failure]')?.textContent)
+      .toContain('unknown stage')
+    expect(container.querySelector<HTMLButtonElement>('[data-stage-switch]')?.disabled).toBe(false)
+  })
+
+  it('opens with Ctrl/Cmd+K and closes on Escape', async () => {
+    const { container } = bodyOf({ wire: wireView() })
+    const root = container.querySelector('[data-stage-tab]')!
+    await act(async () => {
+      fireEvent.keyDown(root, { key: 'k', ctrlKey: true })
+    })
+    expect(container.querySelector('[data-stage-menu]')).not.toBeNull()
+    await act(async () => {
+      fireEvent.keyDown(container.querySelector('.ui-stage-palette')!, { key: 'Escape' })
+    })
+    expect(container.querySelector('[data-stage-menu]')).toBeNull()
   })
 })

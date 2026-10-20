@@ -1,9 +1,15 @@
-/** Test helper: the locale service's bind contract as a plain dictionary read. */
-export function makeTranslate<T extends Record<string, string>>(dict: T): (key: string) => string {
-  return key => {
+/** Test helper: the locale service's bind contract as a plain dictionary read with `{name}` interpolation. */
+export function makeTranslate<T extends Record<string, string>>(
+  dict: T,
+): (key: string, params?: Record<string, unknown>) => string {
+  return (key, params) => {
     const value = dict[key as keyof T]
     if (value === undefined) throw new Error(`missing dictionary key: ${key}`)
-    return value
+    let text: string = value
+    for (const [name, replacement] of Object.entries(params ?? {})) {
+      text = text.replaceAll(`{${name}}`, String(replacement))
+    }
+    return text
   }
 }
 
@@ -26,4 +32,18 @@ export const STAGE_NAMES = {
   third: 'stage-c',
   /** The switch action's picked target (any grammar-valid name). */
   target: 'stage-d',
+} as const
+
+/**
+ * Display aliases for the stages that carry one in the UI fixtures. They are
+ * abstract CJK placeholders, deliberately outside the stage-name grammar: the
+ * alias is display-only and never a command target, so a suite asserting that
+ * a surface *shows* the alias while the action still submits the durable name
+ * pins exactly the contract the Host declares. Kept beside {@link STAGE_NAMES}
+ * so a fixture rename stays one edit.
+ */
+export const STAGE_ALIASES = {
+  first: '甲',
+  second: '乙',
+  third: '丙',
 } as const

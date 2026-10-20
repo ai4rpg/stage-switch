@@ -40,11 +40,12 @@ describe.skipIf(bundle === undefined)('built client bundle', () => {
         if (spec === 'react' || spec === 'react/jsx-runtime') return react
         throw new Error(`unexpected require: ${spec}`)
       }) as { inject: string[], apply: (ctx: Context) => void }
-      expect(exports.inject).toEqual(['slots', 'locale', 'sidebarRightTabs', 'sessions'])
+      expect(exports.inject).toEqual(['slots', 'locale', 'sidebarRightTabs', 'sidebarRight', 'sessions'])
       expect(typeof exports.apply).toBe('function')
       const ctx = new Context()
       const seats: Array<[Record<string, unknown>, unknown]> = []
       ctx.provide('sidebarRightTabs', { register: () => () => {} })
+      ctx.provide('sidebarRight', { openTabIn: () => {} })
       ctx.provide('slots', {
         inject: (_name: string, register: () => () => void) => { register(); return () => {} },
         register: (options: Record<string, unknown>, component: unknown) => {
@@ -58,6 +59,10 @@ describe.skipIf(bundle === undefined)('built client bundle', () => {
       await fiber.await()
       expect(seats[0]?.[0].name).toBe('sidebar.right.pane.tab')
       expect(seats[0]?.[0].key).toBe('@ai4rpg/dsh-ui-sidebar-stage')
+      expect(seats[1]?.[0].name).toBe('sidebar.right.pane.tab.title')
+      expect(seats[1]?.[0].key).toBe('@ai4rpg/dsh-ui-sidebar-stage')
+      expect(seats[2]?.[0].name).toBe('conversation.input.dock')
+      expect(seats[2]?.[0].id).toBe('stage')
       await fiber.dispose()
     } finally {
       delete g.__ModuleLoader__

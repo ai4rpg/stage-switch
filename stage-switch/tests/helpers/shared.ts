@@ -35,9 +35,15 @@ export function stageInstruction(name: string): string {
   return `Instruction for the ${name} stage.`
 }
 
+/** The display alias carried on the first fixture stage (abstract, CJK). */
+export const STAGE_ALIAS = '甲'
+
 /** The configured catalog: three stages built from {@link STAGE_NAMES}. */
-export const TEST_STAGES: StageDefinition[] = STAGE_NAMES.map(name => ({
+export const TEST_STAGES: StageDefinition[] = STAGE_NAMES.map((name, index) => ({
   name,
+  // One aliased stage exercises the display-alias channel end to end; the
+  // alias never enters prompts, records, or commands.
+  ...index === 0 ? { alias: STAGE_ALIAS } : {},
   instruction: stageInstruction(name),
 }))
 

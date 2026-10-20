@@ -43,12 +43,13 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import UserQuestionService, { type AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
 import { assertV4RowAdmission } from '@deepseek-ai/dsh-session-format-v3-to-v4'
 import StageController, { GOTO_STAGE, foldStage } from '../src/index.ts'
+import type { StageWireView } from '../src/index.ts'
 import { stageSwitchPrompts, formatPrompt, resolveStageSwitchPrompts } from '../src/prompts.ts'
 
 /** The Chinese dictionary the zh composition case expects, derived from the same resolver the service uses. */
 const ZH = resolveStageSwitchPrompts('zh')
 import {
-  APPROVE_LABEL, MemoryFs, STAGE_CONFIG, STAGE_FIRST, STAGE_NAMES, STAGE_SECOND, STAGE_THIRD, TEST_STAGES,
+  APPROVE_LABEL, MemoryFs, STAGE_ALIAS, STAGE_CONFIG, STAGE_FIRST, STAGE_NAMES, STAGE_SECOND, STAGE_THIRD, TEST_STAGES,
   assembleFor, boundary, openTurn, promptTexts, stageInstruction, stageNoticeSummaries,
 } from './helpers/shared.ts'
 import {
@@ -66,7 +67,11 @@ afterEach(async () => {
 })
 
 const STAGE_ROWS = TEST_STAGES
-  .map(stage => `      - name: ${stage.name}\n        instruction: ${JSON.stringify(stage.instruction)}`)
+  .map(stage => [
+    `      - name: ${stage.name}`,
+    ...stage.alias === undefined ? [] : [`        alias: ${JSON.stringify(stage.alias)}`],
+    `        instruction: ${JSON.stringify(stage.instruction)}`,
+  ].join('\n'))
   .join('\n')
 
 async function loadComposition(
@@ -171,6 +176,16 @@ describe('real Loader composition through cordis.yml', () => {
     // is live and carries the folded state the service reads.
     expect(ctx.sessionProjections.stateOf(agent.session, 'stage'))
       .toMatchObject({ stage: STAGE_FIRST, hasStagePrompt: true })
+
+    // The wire view is the client-visible read model: the configured catalog
+    // (with instructions) and the recorded journey, even before the browser
+    // has folded any event window.
+    const wireView = ctx.sessionProjections.snapshot(agent.session).values.stage as StageWireView
+    expect(wireView.stage).toBe(STAGE_FIRST)
+    expect(wireView.stages).toEqual(TEST_STAGES)
+    expect(wireView.stages[0]?.alias).toBe(STAGE_ALIAS)
+    expect(wireView.history).toMatchObject([{ stage: STAGE_FIRST, switched: false }])
+    expect(wireView.historyTruncated).toBe(false)
 
     // Model-visible request variables name the folded stage and the targets.
     const assembly = await assembleFor(ctx, agent)

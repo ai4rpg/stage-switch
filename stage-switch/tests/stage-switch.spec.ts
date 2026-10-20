@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context, Service } from '@deepseek-ai/cordis'
-import { createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
+import { createAssistantMessage, createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import SystemPrompt, { renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -15,11 +15,11 @@ import type { FsWriteOutcome } from '@deepseek-ai/dsh-fs'
 import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import StageController, { GOTO_STAGE, foldStage, resolveConfig } from '../src/index.ts'
-import type { StageConfig } from '../src/index.ts'
+import type { StageConfig, StageWireView } from '../src/index.ts'
 import { stageSwitchPrompts, formatPrompt, resolveStageSwitchPrompts } from '../src/prompts.ts'
 import { DEFAULT_STAGE_SWITCH_PROMPTS } from '../src/prompts.defaults.ts'
 import {
-  APPROVE_LABEL, KEEP_LABEL, MemoryFs, STAGE_CONFIG, STAGE_FIRST, STAGE_NAMES, STAGE_SECOND, STAGE_THIRD,
+  APPROVE_LABEL, KEEP_LABEL, MemoryFs, STAGE_ALIAS, STAGE_CONFIG, STAGE_FIRST, STAGE_NAMES, STAGE_SECOND, STAGE_THIRD, TEST_STAGES,
   assembleFor, boundary, openTurn, promptTexts, stageInstruction,
 } from './helpers/shared.ts'
 
@@ -166,6 +166,32 @@ describe('resolveConfig', () => {
       minHandoffTokens: 500,
     }
     expect(resolveConfig(config)).toEqual(config)
+  })
+
+  it('accepts and trims an optional display alias per stage', () => {
+    const config = {
+      ...STAGE_CONFIG,
+      stages: [
+        { name: STAGE_FIRST, alias: `  ${STAGE_ALIAS}  `, instruction: stageInstruction(STAGE_FIRST) },
+        { name: STAGE_SECOND, instruction: stageInstruction(STAGE_SECOND) },
+      ],
+    }
+    expect(resolveConfig(config)).toEqual({
+      ...config,
+      stages: [
+        { name: STAGE_FIRST, alias: STAGE_ALIAS, instruction: stageInstruction(STAGE_FIRST) },
+        { name: STAGE_SECOND, instruction: stageInstruction(STAGE_SECOND) },
+      ],
+    })
+  })
+
+  it('rejects an empty or oversized stage alias', () => {
+    for (const alias of ['', '   ', 'x'.repeat(61)] as const) {
+      expect(() => resolveConfig({
+        ...STAGE_CONFIG,
+        stages: [{ name: STAGE_FIRST, alias, instruction: stageInstruction(STAGE_FIRST) }],
+      })).toThrow('`alias`')
+    }
   })
 
   it('rejects a missing or empty stages list', () => {
@@ -1118,5 +1144,83 @@ describe('HMR disposal', () => {
     await fiber.dispose()
     const after = await assembleFor(ctx, agent)
     expect(after.contexts.map(context => context.name)).not.toContain('stage:policy')
+  })
+})
+
+describe('stage projection wire view', () => {
+  it('publishes the catalog, the initial stage, and per-stage counters', async () => {
+    const ctx = await setup()
+    const agent = await agentWithSession(ctx, 'wire-view')
+    const session = agent.session
+    const read = (): StageWireView =>
+      ctx.sessionProjections.snapshot(session).values.stage as StageWireView
+
+    const before = read()
+    expect(before.stage).toBe(STAGE_FIRST)
+    expect(before.stages).toEqual(TEST_STAGES)
+    expect(before.stages[0]?.alias).toBe(STAGE_ALIAS)
+    expect(before.history).toEqual([])
+    expect(before.historyTruncated).toBe(false)
+
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: `Current stage: ${STAGE_FIRST}\n${stageInstruction(STAGE_FIRST)}` }],
+      source: { kind: 'stage-switch', form: 'notice', summary: `Current stage: ${STAGE_FIRST}` },
+    }), { surfaceOp: 'append' })
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'hello' }],
+      source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: createAssistantMessage({
+        content: [{ type: 'text', text: 'hi' }],
+        source: { provider: 'test', model: 'test-model' },
+      }),
+      stream: [],
+      usage: { inputTokens: 10, outputTokens: 5 },
+    }, { surfaceOp: 'append' })
+    session.append('tool/call', {
+      turn: 1,
+      step: 1,
+      callId: ToolCallId('wire-call'),
+      name: 'bash',
+      arguments: '{}',
+    })
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: `Stage switched to ${STAGE_SECOND}\n${stageInstruction(STAGE_SECOND)}` }],
+      source: { kind: 'stage-switch', form: 'notice', summary: `Stage switched to ${STAGE_SECOND}` },
+    }), { surfaceOp: 'append' })
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'next' }],
+      source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+
+    const after = read()
+    expect(after.stage).toBe(STAGE_SECOND)
+    expect(after.stages.map(stage => stage.name)).toEqual([...STAGE_NAMES])
+    expect(after.history).toHaveLength(2)
+    const first = after.history[0]
+    const second = after.history[1]
+    if (first === undefined || second === undefined) throw new Error('expected two stage history entries')
+    expect(first).toMatchObject({
+      stage: STAGE_FIRST,
+      switched: false,
+      messages: 2,
+      tools: 1,
+      tokens: 15,
+      errors: 0,
+    })
+    expect(second).toMatchObject({
+      stage: STAGE_SECOND,
+      switched: true,
+      messages: 1,
+      tools: 0,
+      tokens: 0,
+      errors: 0,
+    })
+    expect(first.seq).toBeLessThan(second.seq)
+    expect(first.time).toBeLessThanOrEqual(second.time)
+    expect(after.historyTruncated).toBe(false)
   })
 })

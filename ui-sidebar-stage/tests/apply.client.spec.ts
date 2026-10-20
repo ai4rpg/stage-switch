@@ -15,14 +15,18 @@ import { STAGE_ID, STAGE_KIND } from '../src/client/definition.tsx'
 import { apply, inject } from '../src/client/index.tsx'
 import { apply as hostApply } from '../src/index.ts'
 import { StageBody } from '../src/client/StageBody.tsx'
+import { StageTitle } from '../src/client/StageTitle.tsx'
+import { StageDock } from '../src/client/StageDock.tsx'
 import { en, zh } from '../src/client/locales.ts'
 import { STAGE_NAMES } from './helpers.ts'
 
 interface Recorded {
   name: string
-  key: string
-  locale: string
-  inject: unknown
+  key?: string
+  id?: string
+  order?: number
+  locale?: string
+  inject?: unknown
   component: unknown
 }
 
@@ -53,13 +57,15 @@ async function boot() {
     }),
   }
   const sessions = { binding: vi.fn() }
+  const sidebarRight = { openTabIn: vi.fn() }
   ctx.provide('sidebarRightTabs', tabs as never)
+  ctx.provide('sidebarRight', sidebarRight as never)
   ctx.provide('slots', slots as never)
   ctx.provide('locale', locale as never)
   ctx.provide('sessions', sessions as never)
   const fiber = ctx.plugin({ inject: [...inject], apply })
   await fiber.await()
-  return { types, registered, dictionaries, fiber, sessions }
+  return { types, registered, dictionaries, fiber, sessions, sidebarRight }
 }
 
 describe('ui-sidebar-stage apply', () => {
@@ -67,7 +73,7 @@ describe('ui-sidebar-stage apply', () => {
     expect(hostApply).not.toThrow()
   })
 
-  it('registers the type, its dictionaries, and the body seat under the type\'s id', async () => {
+  it('registers the type, its dictionaries, the body, the live title, and the composer dock', async () => {
     const { types, registered, dictionaries } = await boot()
     const definition = types[0] as Record<string, unknown>
     expect(definition.id).toBe(STAGE_ID)
@@ -76,16 +82,36 @@ describe('ui-sidebar-stage apply', () => {
     const guide = definition.guide as Array<Record<string, unknown>>
     expect(guide).toHaveLength(1)
     expect(dictionaries.get('sidebarStage')).toEqual({ zh, en })
-    // The seat key is the implementation's id, not the kind.
-    expect(registered.map(entry => [entry.name, entry.key, entry.locale, entry.component])).toEqual([
-      ['sidebar.right.pane.tab', STAGE_ID, 'sidebarStage', StageBody],
-    ])
-    expect(typeof registered[0]?.inject).toBe('function')
+    // The body and live title are keyed by the implementation's id, not the
+    // kind; the dock is a list entry under the kind.
+    const body = registered.find(entry => entry.name === 'sidebar.right.pane.tab')
+    const title = registered.find(entry => entry.name === 'sidebar.right.pane.tab.title')
+    const dock = registered.find(entry => entry.name === 'conversation.input.dock')
+    expect(body?.key).toBe(STAGE_ID)
+    expect(body?.locale).toBe('sidebarStage')
+    expect(body?.component).toBe(StageBody)
+    expect(typeof body?.inject).toBe('function')
+    expect(title?.key).toBe(STAGE_ID)
+    expect(title?.locale).toBe('sidebarStage')
+    expect(title?.component).toBe(StageTitle)
+    expect(dock?.id).toBe(STAGE_KIND)
+    expect(dock?.order).toBe(20)
+    expect(dock?.locale).toBe('sidebarStage')
+    expect(dock?.component).toBe(StageDock)
+  })
+
+  it('opens the stage tab from the composer dock', async () => {
+    const { registered, sidebarRight } = await boot()
+    const dock = registered.find(entry => entry.name === 'conversation.input.dock')
+    const face = dock?.inject as (sessionId: string) => { openStage: () => void }
+    face('s-1').openStage()
+    expect(sidebarRight.openTabIn).toHaveBeenCalledWith('s-1', STAGE_KIND)
   })
 
   it('builds the stage view source and the switch action per session in the inject face', async () => {
     const { registered, sessions } = await boot()
-    const injectFace = registered[0]?.inject as (sessionId: string) => {
+    const body = registered.find(entry => entry.name === 'sidebar.right.pane.tab')
+    const injectFace = body?.inject as (sessionId: string) => {
       hooks: { stage: unknown }
       switchStage: (stage: string) => Promise<unknown>
     }

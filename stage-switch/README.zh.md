@@ -1,15 +1,17 @@
 # @ai4rpg/dsh-stage-switch
 
-`@ai4rpg/dsh-stage-switch` 的独立仓库，一个为 DeepSeek Harness agent harness（[deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)）开发的阶段协作插件。设计决策记录见 [docs/DESIGN.zh.md](docs/DESIGN.zh.md)。
+`@ai4rpg/dsh-stage-switch` 是为 DeepSeek Harness agent harness（[deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)）提供的可选阶段协作插件。设计决策记录见 [docs/DESIGN.zh.md](docs/DESIGN.zh.md)。
 
 [English](README.md) | 中文
 
-按 agent（智能体）分别记录到日志的阶段协作状态：部署方配置的阶段提示词、一个把关切换引导的判定器 seam、写入工作区的交接文档，以及经用户评审的 `goto_stage` 切换——批准后将模型可见历史归档。
+本插件按 agent（智能体）分别记录阶段协作状态到日志，包括部署方配置的阶段提示词、一个把关切换引导的判定器 seam、写入工作区的交接文档，以及经用户评审的 `goto_stage` 切换——批准后将模型可见历史归档。
 
 ## 持久状态
 
 阶段记录搭载在每次阶段进入都会追加的 stage-switch 插件消息上——阶段提示（`Current stage: <name>`）或交接提示（`Stage switched to <name>`），都是官方 harness 事件目录已知的普通 `user/message`。每条记录的 source 为生产者自有：`kind: 'stage-switch'`，`notice` 形态并携带 summary。更早版本写入的记录经 harness 的 V3→V4 会话转换后以 `plugin:stage-switch` 返回；`foldStage` 同时接受两种 kind，因此旧会话 resume 仍落在其记录的阶段上。`foldStage(events)` 返回最后一条记录的阶段，无记录时为 `undefined`；服务在第一条记录之前折叠到配置的 `initial` 阶段（默认第一个阶段），因此 resume、fork 与 compaction 直接从会话日志恢复阶段。UI 通过 `session/event` 观察已提交的切换。
-读取经由服务注册在 `ctx.sessionProjections` 上的 `stage` 会话投影单元（必需注入）：由框架对已提交事件驱动同一套逐事件折叠并做检查点，因此每次读取只花 O(新增事件) 而不是全量扫描日志——harness 已废弃同步的全日志读取器，本包对它们的调用数为零。该单元只存在于 host 侧（无 client wire view）；侧栏客户端包仍自行折叠持久记录。
+
+读取经由服务注册在 `ctx.sessionProjections` 上的 `stage` 会话投影单元（必需注入）：由框架对已提交事件驱动同一套逐事件折叠并做检查点，因此每次读取只花 O(新增事件) 而不是全量扫描日志——harness 已废弃同步的全日志读取器，本包对它们的调用数为零。该单元的 host 状态驱动服务的全部读取；它的 `wire` view 发布客户端可见的阶段值——带 instruction 与可选显示别名的配置目录、已记录的旅程、每阶段的消息/工具/token/错误计数——客户端无需重扫日志即可渲染旅程。projection key 是 runtime 全局的（部署可以从 agent 预设挂载本插件，因而该 key 对整个 runtime 可见），因此侧栏阶段标签页以会话自身的持久阶段记录作为激活门槛：有记录时优先用 wire 值，没有时保留自己的折叠回退（其他预设的会话，或尚未到第一个被接受 step 的会话）。
+
 `ctx.stage.current(session)` 读取当前阶段。已评审的切换保持 pending，在下一个被接受的 in-turn pre-step 应用，因此当前工具批次保持其阶段上下文，切换由工具结果自身叙述。
 
 ## 判定器 seam
@@ -46,10 +48,13 @@
   config:
     stages:
       - name: explore
+        alias: 探索
         instruction: Explore the problem space and present a plan.
       - name: implement
+        alias: 实现
         instruction: Implement the approved plan.
       - name: verify
+        alias: 验证
         instruction: Verify the implementation with tests.
     section: |
       The current stage is complete. Call goto_stage to switch to a later
@@ -60,9 +65,11 @@
     minHandoffTokens: 4000
 ```
 
-`stages` 必填、非空、名称唯一；名称必须匹配 `[a-z][a-z0-9_-]*`，以保证交接文件名安全。每份交接文档落在会话 cwd 下的 `<handoffDir>/<会话 id>/<stage>.md`——按会话分目录让共享同一工作区的会话互不覆盖彼此的文档。`section` 必填且非空。`handoffDir` 默认 `handoff`；`initial` 默认第一个阶段且必须命名已配置的阶段；`minHandoffTokens` 可选且必须非负；`language` 选择评审弹窗语言——`en`（默认）或 `zh`，即中文评审弹窗词典（见下文）。未知 key 在加载时失败。
+`stages` 必填、非空、名称唯一；名称必须匹配 `[a-z][a-z0-9_-]*`，以保证交接文件名安全。阶段还可声明可选的 `alias`——显示用标签（例如本地化名称），最长 60 个字符。别名只用于显示：`name` 始终是日志、`/stage`、`goto_stage` 以及所有模型可见面的持久化身份，别名随客户端 wire view 下发，供侧栏标签页及其环境化表面显示本地化标签。每份交接文档落在会话 cwd 下的 `<handoffDir>/<会话 id>/<stage>.md`——按会话分目录让共享同一工作区的会话互不覆盖彼此的文档。`section` 必填且非空。`handoffDir` 默认 `handoff`；`initial` 默认第一个阶段且必须命名已配置的阶段；`minHandoffTokens` 可选且必须非负；`language` 选择评审弹窗语言——`en`（默认）或 `zh`，即中文评审弹窗词典（见下文）。未知 key 在加载时失败。
 
 配置了 `minHandoffTokens` 时，组合中需要 `@deepseek-ai/dsh-token-meter`；缺失时 `goto_stage` 调用会大声失败。服务的投影读取还需要 `@deepseek-ai/dsh-session-projection`——harness 的 base bundle 已挂载它，因此标准组合天然具备；缺失时激活阶段即大声失败。
+
+本包声明 `engines.dsh`（`>=0.2.0-rc.2 <0.3.0-0`）作为 DSH 兼容门禁。DSH 的 app-boot 与 plugin-manager 优先使用该区间而不是 dsh `peerDependencies`；peers 仍保留在 manifest 中，因为 Loader 的 profile resolution 要用这些名字把本插件的宿主包 import 路由到安装副本。dsh peer 区间同时接受 0.2.0 线与 0.2.1 预发布线，因此任一条线上的宿主都能通过 npm 的 peer 检查。兼容性以 engine 区间为准，而不是 peer 区间；超出该区间的 dsh 安装不受支持。
 
 ## 提示词文案
 
@@ -70,7 +77,7 @@
 
 模板可引用 `{name}` 占位符，由 `formatPrompt` 插值——例如 `review.fullQuestion: "Approve switching to stage \"{stage}\" and archiving the conversation?"`。
 
-**刻意不进** prompts.json 的是 fold 与提示注入路径解析的承载格式：
+以下承载格式**刻意不进** prompts.json，因为 fold 与提示注入路径会解析它们：
 
 - 阶段提示正文前缀 `Current stage: <name>`（叙述前缀 *"The user switched this session to stage …"* 是可编辑文案）；
 - `source.summary` 的 notice 形态（`Current stage: <name>` / `Stage switched to <name>`）；
@@ -87,13 +94,9 @@ npm run build                                # prebuild 钩子自动跑 sync-pro
 
 ### 中文评审弹窗文案
 
-本包带一份中文评审弹窗文案覆盖层
-（`src/prompts.zh.json`，8 条键值）；其他用户可见文案（工具描述、提示消息、
-错误信息、命令文本等）保持英文。
+本包带一份中文评审弹窗文案覆盖层（`src/prompts.zh.json`，8 条键值）；其他用户可见文案（工具描述、提示消息、错误信息、命令文本等）保持英文。
 
-**部署声明式路径（推荐）：** 在插件行上设置 `language: zh`——服务在构造时
-解析中文词典，因此该选择存在于组合中（挂载本插件的同一份 patch 里），
-每次重装都保留，且无需任何安装后脚本：
+**优先使用部署声明式路径：** 在插件行上设置 `language: zh`——服务在构造时解析中文词典，因此该选择存在于组合中（挂载本插件的同一份 patch 里），每次重装都保留，且无需任何安装后脚本：
 
 ```yaml
 - id: stage-switch
@@ -103,17 +106,13 @@ npm run build                                # prebuild 钩子自动跑 sync-pro
     # ...stages、section 及其余配置
 ```
 
-**文件级路径（旧法）：** 改为合并到已装副本——适用于无法编辑组合的部署：
+**无法编辑组合时，改用文件级路径（旧法）：** 把覆盖层合并到已装副本。
 
 ```sh
 node node_modules/@ai4rpg/dsh-stage-switch/scripts/apply-zh.mjs
 ```
 
-该脚本将中文评审文案深度合并到已装的
-`src/prompts.json` 中。内嵌兜底（`lib/prompts.defaults.js`）不受影响——
-安装包丢失 JSON 文件时仍回退到英文。回退文件级合并：重装包
-（`dsh plugin remove + add`），恢复英文 `src/prompts.json`。**每次重装或升级后
-重新运行该脚本**——或改用配置路径，它没有这一步。
+该脚本将中文评审文案深度合并到已装的 `src/prompts.json` 中。内嵌兜底（`lib/prompts.defaults.js`）不受影响——安装包丢失 JSON 文件时仍回退到英文。回退文件级合并：重装包（`dsh plugin remove + add`），恢复英文 `src/prompts.json`。**每次重装或升级后重新运行该脚本**——或改用配置路径，它没有这一步。
 
 ## 模型体验
 

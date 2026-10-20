@@ -43,7 +43,6 @@ describe.skipIf(!active)('workspace integration over the dsh source checkout', (
     const { SlotTestRuntime } = await import('@deepseek-ai/dsh-client-test-runtime')
     const { LocaleRuntime } = await import('@deepseek-ai/dsh-client-locale/client')
     const { STAGE_ID } = await import('../src/client/definition.tsx')
-    const { en } = await import('../src/client/locales.ts')
     const { apply, inject } = await import('../src/client/index.tsx')
     type SessionEventLikeEntry = import('@deepseek-ai/dsh-api-session-controller/client').SessionEventLikeEntry
 
@@ -68,6 +67,7 @@ describe.skipIf(!active)('workspace integration over the dsh source checkout', (
       // uses the real runtime + installLocale (the official pattern), so the
       // renderer synthesizes the real `t` seat from this package's dictionary.
       runtime.ctx.provide('sidebarRightTabs', { register: () => () => {} })
+      runtime.ctx.provide('sidebarRight', { openTabIn: () => {} })
       const locale = new LocaleRuntime(runtime.ctx)
       runtime.ctx.provide('locale', locale)
       runtime.slots.installLocale(locale)
@@ -76,7 +76,11 @@ describe.skipIf(!active)('workspace integration over the dsh source checkout', (
       // The declared inject face (tabInfo hooks) is ui-sidebar-right's; this
       // suite exercises only this package's own face, so the declaration is
       // cast to the runtime's children contract.
-      await runtime.declare({ 'sidebar.right.pane.tab': { kind: 'keyed', scope: 'session' } } as never)
+      await runtime.declare({
+        'sidebar.right.pane.tab': { kind: 'keyed', scope: 'session' },
+        'sidebar.right.pane.tab.title': { kind: 'keyed', scope: 'session' },
+        'conversation.input.dock': { kind: 'list', scope: 'session' },
+      } as never)
       const sessionId = await runtime.sessions.add({ id: 's-stage' })
       const reference = runtime.sessions.retain(sessionId)
       await reference.ready
@@ -87,12 +91,19 @@ describe.skipIf(!active)('workspace integration over the dsh source checkout', (
 
       const view = runtime.renderSlot('sidebar.right.pane.tab', {}, { session: reference, entryKey: STAGE_ID })
       expect(view.container.querySelector('[data-stage-current]')?.textContent).toBe(STAGE_NAMES.second)
-      expect([...view.container.querySelectorAll('[data-stage-history] li')].map(item => item.textContent))
-        .toEqual([`${en.entered} ${STAGE_NAMES.first}`, `${en.switched} ${STAGE_NAMES.second}`])
+      // The live title is registered through the production title slot; with
+      // no stage projection in this composition it shows the type label.
+      const title = runtime.renderSlot('sidebar.right.pane.tab.title', {}, { session: reference, entryKey: STAGE_ID })
+      expect(title.container.textContent).toBe('Stage')
+      const rowNames = (): (string | null | undefined)[] => [...view.container.querySelectorAll('[data-stage-history] li .ui-stage-row-name')]
+        .map(item => item.textContent)
+      expect(rowNames()).toEqual([STAGE_NAMES.first, STAGE_NAMES.second])
 
-      // Live update: a new stage record re-renders the body.
+      // Live update: a new stage record re-renders the body (the fold
+      // fallback, since the test runtime composes no stage projection).
       await runtime.sessions.appendEvent(sessionId, stageEntry(3, `Stage switched to ${STAGE_NAMES.third}`))
       expect(view.container.querySelector('[data-stage-current]')?.textContent).toBe(STAGE_NAMES.third)
+      expect(rowNames()).toEqual([STAGE_NAMES.first, STAGE_NAMES.second, STAGE_NAMES.third])
 
       await handle.dispose()
     } finally {

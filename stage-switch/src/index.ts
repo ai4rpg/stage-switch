@@ -73,26 +73,90 @@ declare module '@deepseek-ai/dsh-llm' {
 
 /**
  * The `stage` projection key this package owns on the session-projection
- * seam: a host-only unit with no client wire view. The sidebar client
- * package folds the durable records itself by design (zero RPC, and it must
- * keep working on sessions whose composition never mounted this plugin), so
- * nothing here publishes a wire value.
+ * seam. The host state ({@link StageProjectionState}) drives the service's
+ * reads; its `wire` view publishes the client-visible stage catalog, history,
+ * and per-stage counters the sidebar tab renders. The sidebar still keeps its
+ * own fold fallback for sessions whose composition never mounted this plugin.
  */
 declare module '@deepseek-ai/dsh-session-projection/types' {
   interface SessionProjectionStateMap {
     stage: StageProjectionState
+  }
+
+  interface SessionProjectionMap {
+    stage: StageWireView
   }
 }
 
 /** The model-facing transition tool's name. It stays registered in every stage. */
 export const GOTO_STAGE = 'goto_stage'
 
-/** One configured stage: a name plus the instruction the model sees while in it. */
+/** Bound on a stage's display alias; keeps the tab's hero and palette rows sane. */
+export const STAGE_ALIAS_MAX_LENGTH = 60
+
+/** One configured stage: a name, an optional display alias, and the instruction the model sees while in it. */
 export interface StageDefinition {
   /** Stage name; must match `[a-z][a-z0-9_-]*` so handoff file names stay safe. */
   name: string
+  /**
+   * Optional display alias (e.g. a localized label). Display-only: the name
+   * stays the durable identity in the log, the `/stage` command, the
+   * `goto_stage` tool, and every model-facing surface; the alias rides the
+   * client wire view so UI surfaces can show a localized label.
+   */
+  alias?: string
   /** The stage's task instruction, appended as the stage-prompt body at every stage entry. */
   instruction: string
+}
+
+/**
+ * One recorded stage entry with the counters the stage tab renders.
+ *
+ * The metrics cover the log span from this record to the next stage record (or
+ * the present for the current entry). `messages` counts non-stage user
+ * messages and assistant messages; `tools` counts `tool/call`; `tokens` sums
+ * provider-reported usage on `assistant/message`; `errors` counts `tool/result`
+ * events carrying an error. All fields are plain JSON: the projection state is
+ * checkpointed.
+ */
+export interface StageHistoryEntry {
+  /** The stage the entry records. */
+  readonly stage: string
+  /** Monotonic session sequence number of the record. */
+  readonly seq: number
+  /** Unix epoch milliseconds of the record. */
+  readonly time: number
+  /** Whether the record marks a transition (`Stage switched to`) rather than a session-start entry. */
+  readonly switched: boolean
+  /** Non-stage user messages plus assistant messages since this record. */
+  readonly messages: number
+  /** `tool/call` events since this record. */
+  readonly tools: number
+  /** Provider-reported tokens accumulated since this record. */
+  readonly tokens: number
+  /** Failed `tool/result` events since this record. */
+  readonly errors: number
+}
+
+/**
+ * Client-visible value of the `stage` session projection.
+ *
+ * `stage` folds to the configured initial stage before the first durable
+ * record, so a fresh session already has a hero value; `history` is the
+ * complete recorded journey (bounded by {@link STAGE_HISTORY_LIMIT}) even when
+ * the browser's event window is truncated. The sidebar reads this value when
+ * the projection is mounted and falls back to its own event-window fold when
+ * it is absent.
+ */
+export interface StageWireView {
+  /** Stage in force, or the configured initial stage before the first record. */
+  readonly stage: string
+  /** Ordered configured catalog with each stage's instruction. */
+  readonly stages: readonly StageDefinition[]
+  /** Recorded stage entries in log order, ending with the current stage. */
+  readonly history: readonly StageHistoryEntry[]
+  /** Whether the oldest history entries were dropped to bound the projection. */
+  readonly historyTruncated: boolean
 }
 
 /** Deployment-owned stage-switch configuration. */
@@ -187,7 +251,7 @@ export function resolveConfig(config: StageConfig): StageConfig {
   const names = new Set<string>()
   const validatedStages: StageDefinition[] = []
   for (const definition of stages) {
-    const { name, instruction } = definition as Partial<StageDefinition>
+    const { name, alias, instruction } = definition as Partial<StageDefinition>
     if (typeof name !== 'string' || !STAGE_NAME.test(name)) {
       throw new Error(`StageConfig stage name must match ${String(STAGE_NAME)}, got ${JSON.stringify(name)}`)
     }
@@ -195,10 +259,21 @@ export function resolveConfig(config: StageConfig): StageConfig {
       throw new Error(`StageConfig has duplicate stage "${name}"`)
     }
     names.add(name)
+    if (alias !== undefined
+      && (typeof alias !== 'string' || alias.trim() === '' || alias.trim().length > STAGE_ALIAS_MAX_LENGTH)) {
+      throw new Error(
+        `StageConfig stage "${name}" \`alias\` must be a non-empty string of at most`
+        + ` ${STAGE_ALIAS_MAX_LENGTH} characters when supplied`,
+      )
+    }
     if (typeof instruction !== 'string' || instruction.trim() === '') {
       throw new Error(`StageConfig stage "${name}" needs a non-empty string \`instruction\``)
     }
-    validatedStages.push({ name, instruction })
+    validatedStages.push(
+      alias === undefined
+        ? { name, instruction }
+        : { name, alias: alias.trim(), instruction },
+    )
   }
   const section = (config as Partial<StageConfig>).section
   if (typeof section !== 'string' || section.trim() === '') {
@@ -282,7 +357,8 @@ function stageSummaryOf(source: MessageSource): string | undefined {
 }
 
 /**
- * The stage one log entry records, or `undefined` when it records none.
+ * The stage record one log entry carries, or `undefined` when it records
+ * none.
  *
  * The stage record is the plugin message that EVERY stage entry appends —
  * the stage prompt (`Current stage: <name>`) or the handoff notice
@@ -290,11 +366,76 @@ function stageSummaryOf(source: MessageSource): string | undefined {
  * harness catalog already knows, so a reader without this plugin loads the
  * log without complaint.
  */
-function stageFromEvent(event: SessionEvent): string | undefined {
+function stageRecordFromEvent(event: SessionEvent): { stage: string; switched: boolean } | undefined {
   if (event.type !== 'user/message') return undefined
   const summary = stageSummaryOf(event.data.source)
   if (summary === undefined) return undefined
-  return STAGE_SUMMARY.exec(summary)?.[1]
+  const stage = STAGE_SUMMARY.exec(summary)?.[1]
+  if (stage === undefined) return undefined
+  return { stage, switched: summary.startsWith('Stage switched to ') }
+}
+
+/** The stage one log entry records, or `undefined` when it records none. */
+function stageFromEvent(event: SessionEvent): string | undefined {
+  return stageRecordFromEvent(event)?.stage
+}
+
+/** Plain-JSON schema for one stage-history entry. */
+const stageHistoryEntrySchema = z.object({
+  stage: z.string(),
+  seq: z.number().int().nonnegative(),
+  time: z.number().nonnegative(),
+  switched: z.boolean(),
+  messages: z.number().int().nonnegative(),
+  tools: z.number().int().nonnegative(),
+  tokens: z.number().int().nonnegative(),
+  errors: z.number().int().nonnegative(),
+}).strict()
+
+/** Per-event counter contribution for the current stage entry. */
+interface StageMetricDelta {
+  messages?: number
+  tools?: number
+  tokens?: number
+  errors?: number
+}
+
+/**
+ * Counters one committed event adds to the current stage entry.
+ *
+ * Stage records are notices, not messages; a non-stage user message and an
+ * assistant message count as messages, `tool/call` as a tool, a failed
+ * `tool/result` as an error, and assistant usage as tokens. Other event types
+ * contribute nothing.
+ */
+function stageMetricDelta(event: SessionEvent): StageMetricDelta | undefined {
+  switch (event.type) {
+    case 'user/message':
+      return stageRecordFromEvent(event) === undefined ? { messages: 1 } : undefined
+    case 'assistant/message': {
+      const usage = event.data.usage
+      if (usage === undefined) return { messages: 1 }
+      const tokens = usage.totalTokens ?? usage.inputTokens + usage.outputTokens
+      return { messages: 1, ...tokens === 0 ? {} : { tokens } }
+    }
+    case 'tool/call':
+      return { tools: 1 }
+    case 'tool/result':
+      return event.data.error === undefined ? undefined : { errors: 1 }
+    default:
+      return undefined
+  }
+}
+
+/** Apply one event's counters to a stage entry. */
+function withStageMetrics(entry: StageHistoryEntry, delta: StageMetricDelta): StageHistoryEntry {
+  return {
+    ...entry,
+    messages: entry.messages + (delta.messages ?? 0),
+    tools: entry.tools + (delta.tools ?? 0),
+    tokens: entry.tokens + (delta.tokens ?? 0),
+    errors: entry.errors + (delta.errors ?? 0),
+  }
 }
 
 /** Plain-JSON checkpoint schema for the `stage` projection unit. */
@@ -305,7 +446,24 @@ const stageProjectionStateSchema = z.object({
   hasStagePrompt: z.boolean(),
   headSeq: z.number().int().nonnegative().nullable(),
   headIsSystem: z.boolean(),
+  history: z.array(stageHistoryEntrySchema),
+  historyTruncated: z.boolean(),
 }).strict()
+
+/** Wire schema for the client-visible stage view. */
+const stageWireViewSchema: z.ZodType<StageWireView> = z.object({
+  stage: z.string(),
+  stages: z.array(z.object({
+    name: z.string(),
+    alias: z.string().optional(),
+    instruction: z.string(),
+  }).strict()),
+  history: z.array(stageHistoryEntrySchema),
+  historyTruncated: z.boolean(),
+}).strict()
+
+/** Bound on the client-visible stage journey; older entries set the truncated flag. */
+const STAGE_HISTORY_LIMIT = 200
 
 /** Whether one event is a stage prompt message (any stage entry). */
 function isStagePromptEvent(event: SessionEvent): boolean {
@@ -349,29 +507,85 @@ function surfaceHeadAfter(
  * nothing returns the same state reference — the unit contract that keeps
  * downstream work at zero.
  */
-const stageProjectionDefinition: ProjectionDefinition<'stage'> = {
-  key: 'stage',
-  stateVersion: 1,
-  stateSchema: stageProjectionStateSchema,
-  init: () => ({
-    stage: null,
-    stageAtLastHeader: null,
-    openTurn: false,
-    hasStagePrompt: false,
-    headSeq: null,
-    headIsSystem: false,
-  }),
-  apply: (state, event) => {
-    const stage = stageFromEvent(event) ?? state.stage
-    const stageAtLastHeader = event.type === 'request/header' ? stage : state.stageAtLastHeader
-    const openTurn = event.type === 'turn/start' ? true : event.type === 'turn/end' ? false : state.openTurn
-    const hasStagePrompt = state.hasStagePrompt || isStagePromptEvent(event)
-    const head = surfaceHeadAfter(state, event)
-    if (stage === state.stage && stageAtLastHeader === state.stageAtLastHeader
-      && openTurn === state.openTurn && hasStagePrompt === state.hasStagePrompt
-      && head.headSeq === state.headSeq && head.headIsSystem === state.headIsSystem) return state
-    return { stage, stageAtLastHeader, openTurn, hasStagePrompt, ...head }
-  },
+function stageProjectionDefinition(
+  stages: readonly StageDefinition[],
+  initial: string,
+): ProjectionDefinition<'stage'> & { wire: NonNullable<ProjectionDefinition<'stage'>['wire']> } {
+  const catalog = stages.map(({ name, alias, instruction }) =>
+    alias === undefined ? { name, instruction } : { name, alias, instruction })
+  let lastView: StageWireView | undefined
+  return {
+    key: 'stage',
+    stateVersion: 2,
+    stateSchema: stageProjectionStateSchema,
+    init: () => ({
+      stage: null,
+      stageAtLastHeader: null,
+      openTurn: false,
+      hasStagePrompt: false,
+      headSeq: null,
+      headIsSystem: false,
+      history: [],
+      historyTruncated: false,
+    }),
+    apply: (state, event) => {
+      const record = stageRecordFromEvent(event)
+      const stage = record?.stage ?? state.stage
+      const stageAtLastHeader = event.type === 'request/header' ? stage : state.stageAtLastHeader
+      const openTurn = event.type === 'turn/start' ? true : event.type === 'turn/end' ? false : state.openTurn
+      const hasStagePrompt = state.hasStagePrompt || isStagePromptEvent(event)
+      const head = surfaceHeadAfter(state, event)
+      let history = state.history
+      let historyTruncated = state.historyTruncated
+      if (record !== undefined) {
+        history = [...history, {
+          stage: record.stage,
+          seq: event.seq,
+          time: event.time,
+          switched: record.switched,
+          messages: 0,
+          tools: 0,
+          tokens: 0,
+          errors: 0,
+        }]
+        if (history.length > STAGE_HISTORY_LIMIT) {
+          history = history.slice(history.length - STAGE_HISTORY_LIMIT)
+          historyTruncated = true
+        }
+      } else {
+        const delta = stageMetricDelta(event)
+        const current = history.at(-1)
+        if (delta !== undefined && current !== undefined) {
+          history = [...history.slice(0, -1), withStageMetrics(current, delta)]
+        }
+      }
+      if (stage === state.stage && stageAtLastHeader === state.stageAtLastHeader
+        && openTurn === state.openTurn && hasStagePrompt === state.hasStagePrompt
+        && head.headSeq === state.headSeq && head.headIsSystem === state.headIsSystem
+        && history === state.history && historyTruncated === state.historyTruncated) return state
+      return { stage, stageAtLastHeader, openTurn, hasStagePrompt, ...head, history, historyTruncated }
+    },
+    wire: {
+      viewSchema: stageWireViewSchema,
+      view: (state) => {
+        const stage = state.stage ?? initial
+        // Reuse the view across internal-only state changes (the open-turn
+        // flag, header watermark, and surface head) so the registry's
+        // Object.is check does not publish a value the client already has.
+        if (lastView !== undefined
+          && lastView.stage === stage
+          && lastView.history === state.history
+          && lastView.historyTruncated === state.historyTruncated) return lastView
+        lastView = {
+          stage,
+          stages: catalog,
+          history: state.history,
+          historyTruncated: state.historyTruncated,
+        }
+        return lastView
+      },
+    },
+  }
 }
 
 /**
@@ -404,7 +618,8 @@ function isSubagentSession(session: Session): boolean {
  */
 function sessionSandboxPolicy(ctx: Context, session: Session): SandboxExecutionPolicy | undefined {
   // The optional service is read through cordis's dynamic accessor: the
-  // sandbox-policy plugin is not a dependency of this package, so the
+  // sandbox-policy plugin is not a runtime dependency (the type import is a
+  // devDependency only), so the
   // composition decides whether it is present (unsandboxed backends ignore
   // the argument). The type-only import above types the lookup.
   return ctx.get('sandboxPolicy')?.resolve({ session })
@@ -434,6 +649,10 @@ interface StageProjectionState {
   headSeq: number | null
   /** Whether surface node 0 is a `system/message` — the protected head. */
   headIsSystem: boolean
+  /** Recorded stage entries in log order; the last entry is the current stage. */
+  history: StageHistoryEntry[]
+  /** Whether the oldest history entries were dropped to bound the projection. */
+  historyTruncated: boolean
 }
 
 /**
@@ -480,12 +699,14 @@ export class StageController extends Service {
     this.handoffDir = resolved.handoffDir ?? 'handoff'
     this.minHandoffTokens = resolved.minHandoffTokens
     this.prompts = resolveStageSwitchPrompts(resolved.language ?? 'en')
-    // The read state: one host-only projection unit the framework drives
-    // eagerly over committed events (see {@link StageProjectionState}).
+    // The read state: one projection unit the framework drives eagerly over
+    // committed events (see {@link StageProjectionState}). Its wire view is
+    // the client-visible catalog/history/counters the sidebar reads; the
+    // factory closes over this instance's catalog and initial stage.
     // Registration is effect-scoped on this service's fiber, so an HMR
     // disposal removes the key; {@link projectionOf} makes an absent key a
     // loud failure, never a silent default.
-    ctx.sessionProjections.register(stageProjectionDefinition)
+    ctx.sessionProjections.register(stageProjectionDefinition(this.stages, this.initial))
     let disposed = false
     // Pre-step is outside Session.append publication, so it can append the
     // stage prompt message inside an open turn without re-entering the
