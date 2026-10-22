@@ -26,7 +26,7 @@
 
 import { writeFile } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { Loader } from '@deepseek-ai/cordis-plugin-loader'
 import { Include } from '@deepseek-ai/cordis-plugin-include'
@@ -336,6 +336,65 @@ describe('real Loader composition through cordis.yml', () => {
     // The idle commit writes the durable notice the fold reads on resume.
     expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_SECOND)
     expect(stageNoticeSummaries(agent.session)).toEqual([`Current stage: ${STAGE_SECOND}`])
+  })
+
+  it('shadows an unused idle switch from the model surface while retaining its log record', { timeout: 60_000 }, async () => {
+    const { ctx, agent } = await loadComposition()
+    const signal = new AbortController().signal
+
+    await ctx.commands.execute(agent, `/stage ${STAGE_SECOND}`, [], signal)
+    expect(promptTexts(agent).some(text => text.includes(`Current stage: ${STAGE_SECOND}`))).toBe(true)
+
+    // The user immediately returns: the transient prompt is shadowed by the
+    // return prompt on the model-visible surface, so the model never sees the
+    // abandoned instruction. The append-only log still records both entries.
+    await ctx.commands.execute(agent, `/stage ${STAGE_FIRST}`, [], signal)
+    const stageTexts = promptTexts(agent).filter(text => text.startsWith('Current stage:'))
+    expect(stageTexts).toEqual([`Current stage: ${STAGE_FIRST}\n${stageInstruction(STAGE_FIRST)}`])
+    expect(stageTexts.some(text => text.includes(`Current stage: ${STAGE_SECOND}`))).toBe(false)
+    expect(stageNoticeSummaries(agent.session)).toEqual([
+      `Current stage: ${STAGE_SECOND}`,
+      `Current stage: ${STAGE_FIRST}`,
+    ])
+    expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_FIRST)
+    const wire = ctx.sessionProjections.snapshot(agent.session).values.stage as StageWireView
+    expect(wire.history.map(entry => entry.stage)).toEqual([STAGE_SECOND, STAGE_FIRST])
+    expect(wire.history[0]).toMatchObject({
+      switched: false, messages: 0, tools: 0, tokens: 0, errors: 0, activeMs: 0,
+    })
+  })
+
+  it('publishes per-visit active time and the open turn window', { timeout: 60_000 }, async () => {
+    // The sidebar clock reads these two wire fields. Assert them through the
+    // real composition (mounted projection unit, shipping session plugins),
+    // not only through the hand-built unit context: an idle stretch must not
+    // reach `activeMs`, the open turn must expose its window, and the settle
+    // must run when the durable `turn/end` lands.
+    const { ctx, agent } = await loadComposition()
+    const signal = new AbortController().signal
+    const wire = (): StageWireView =>
+      ctx.sessionProjections.snapshot(agent.session).values.stage as StageWireView
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    try {
+      await ctx.commands.execute(agent, `/stage ${STAGE_SECOND}`, [], signal)
+      expect(wire().history.at(-1)).toMatchObject({ stage: STAGE_SECOND, activeMs: 0 })
+      expect(wire().activeTurn).toBeUndefined()
+
+      clock.mockReturnValue(2_000)
+      openTurn(agent.session, 1)
+      clock.mockReturnValue(3_000)
+      agent.session.append('step/start', { turn: 1, step: 1 })
+      // The open window starts at the turn and follows committed events.
+      expect(wire().activeTurn).toEqual({ since: 2_000, through: 3_000 })
+
+      clock.mockReturnValue(6_000)
+      agent.session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+      expect(wire().activeTurn).toBeUndefined()
+      // Four active seconds; no wall-clock reading is involved.
+      expect(wire().history.at(-1)).toMatchObject({ stage: STAGE_SECOND, activeMs: 4_000 })
+    } finally {
+      clock.mockRestore()
+    }
   })
 
   it('renders the review dialog in Chinese when the row config declares language: zh', { timeout: 60_000 }, async () => {

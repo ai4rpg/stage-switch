@@ -12,7 +12,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent } from 'react'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { StageCatalogEntry, StageSegment } from './present.ts'
-import { formatClock, formatDuration, stageAccent } from './format.ts'
+import { activeDuration, formatClock, formatDuration, stageAccent } from './format.ts'
 import { stageLabel } from './present.ts'
 
 /** Props supplied by the stage tab body. */
@@ -25,6 +25,10 @@ export interface StagePaletteProps {
   readonly catalog: readonly StageCatalogEntry[]
   /** Recorded visits, used for the visited fallback and per-row metadata. */
   readonly segments: readonly StageSegment[]
+  /** Whether the session is running, for the live row's active-time clock. */
+  readonly running: boolean
+  /** Current Unix epoch milliseconds, from the tab body's ticker. */
+  readonly now: number
   /** Whether a switch command is in flight. */
   readonly pending: boolean
   /** Close the palette without switching. */
@@ -62,12 +66,30 @@ function latestVisit(segments: readonly StageSegment[], stage: string): StageSeg
   return undefined
 }
 
-/** The duration of a visit, ended by the next visit or the current clock. */
-function visitDuration(segments: readonly StageSegment[], segment: StageSegment, now: number): string | undefined {
+/**
+ * The duration of a visit: active turn time when the source carries it, else
+ * the wall-clock span to the next visit.
+ * @param segments - the recorded visits, in log order.
+ * @param segment - the visit to measure.
+ * @param running - whether the session is running (the live visit's clock).
+ * @param now - current Unix epoch milliseconds.
+ * @returns formatted duration text, or undefined when the source cannot tell.
+ */
+function visitDuration(
+  segments: readonly StageSegment[],
+  segment: StageSegment,
+  running: boolean,
+  now: number,
+): string | undefined {
+  const active = activeDuration(segment, running, now)
+  if (active !== undefined) return formatDuration(active)
   if (segment.time === undefined) return undefined
   const index = segments.indexOf(segment)
   const next = index >= 0 ? segments[index + 1] : undefined
-  return formatDuration(next?.time === undefined ? now - segment.time : next.time - segment.time)
+  if (next?.time !== undefined) return formatDuration(next.time - segment.time)
+  // The live visit has no next record to close it; its wall-clock fallback
+  // reads the same (possibly frozen) clock the hero does.
+  return segment.live ? formatDuration(Math.max(0, now - segment.time)) : undefined
 }
 
 /** Search glyph. */
@@ -95,6 +117,8 @@ export function StagePalette({
   current,
   catalog,
   segments,
+  running,
+  now,
   pending,
   onClose,
   onPick,
@@ -174,7 +198,7 @@ export function StagePalette({
     const visit = latestVisit(segments, entry.name)
     if (visit === undefined) return t('notVisited')
     if (visit.time === undefined) return t('notVisited')
-    const duration = visitDuration(segments, visit, Date.now())
+    const duration = visitDuration(segments, visit, running, now)
     return duration === undefined ? formatClock(visit.time) : `${formatClock(visit.time)} · ${duration}`
   }
 

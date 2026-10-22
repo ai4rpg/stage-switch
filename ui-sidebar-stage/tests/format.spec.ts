@@ -3,7 +3,7 @@
  * clamping, and the per-stage identity accent.
  */
 import { describe, expect, it } from 'vitest'
-import { contextPercent, formatDuration, formatTokens, stageAccent } from '../src/client/format.ts'
+import { activeDuration, contextPercent, formatDuration, formatTokens, stageAccent } from '../src/client/format.ts'
 import { STAGE_NAMES } from './helpers.ts'
 
 describe('formatDuration', () => {
@@ -12,6 +12,29 @@ describe('formatDuration', () => {
     expect(formatDuration(42_900)).toBe('42s')
     expect(formatDuration(761_000)).toBe('12m 41s')
     expect(formatDuration(3_840_000)).toBe('1h 04m')
+  })
+})
+
+describe('activeDuration', () => {
+  it('has no value when the source predates active-turn timing', () => {
+    expect(activeDuration({}, true, 10_000)).toBeUndefined()
+  })
+
+  it('returns settled turn time when no turn is open', () => {
+    expect(activeDuration({ activeMs: 12_000 }, true, 10_000)).toBe(12_000)
+  })
+
+  it('advances the open window while running and freezes at the newest folded event when idle', () => {
+    const timing = { activeMs: 5_000, active: { since: 20_000, through: 23_000 } }
+    expect(activeDuration(timing, true, 30_000)).toBe(15_000)
+    // Idle: the clock stops at `through`, not at the current wall time.
+    expect(activeDuration(timing, false, 60_000)).toBe(8_000)
+  })
+
+  it('clamps a window whose start is ahead of the clock', () => {
+    const timing = { activeMs: 5_000, active: { since: 20_000, through: 19_000 } }
+    expect(activeDuration(timing, true, 18_000)).toBe(5_000)
+    expect(activeDuration(timing, false, 18_000)).toBe(5_000)
   })
 })
 

@@ -20,7 +20,7 @@ Status: implemented
 
 ### 读取经由会话投影 seam
 
-服务在 `ctx.sessionProjections`（必需注入）上注册唯一一个投影单元（`key: 'stage'`）。框架的 eager 驱动对每个已提交事件施加与 `foldStage` 相同的逐事件记录逻辑，外加边界机制所需的状态：最后一个 `request/header` 处的阶段（叙述判定）、开回合标志（空闲提交 vs 排队提交）、日志是否已携带阶段提示（仅一次的初始注入），以及表面头节点的种类——node 0 是否为完整切换替换必须跳过的受保护 `system/message`。读取（`stateOf`）只推进新增事件，且 base bundle 的投影缓存会做检查点，因此 resume 的会话至多重折叠一个尾部。这取代了早前版本每次读取都做的全日志扫描：harness 已废弃同步的全日志读取器（`Session.snapshotEvents()` 等），因为存储方向不再在内存中保留完整事件序列，而投影 seam 是官方认可的替代。该单元的 host 状态驱动服务读取；它的 `wire` view 发布客户端可见的阶段值——带 instruction 与可选显示别名的配置目录、已记录的旅程、每阶段的消息/工具/token/错误计数。projection key 是 runtime 全局的（从 agent 预设挂载本插件会让 key 对整个 runtime 可见），因此侧栏阶段标签页以会话自身的持久阶段记录作为激活门槛：有记录时优先用该值，否则保留自己的事件窗口折叠回退（其他预设的会话，或尚未到第一个被接受 step 的会话），零 RPC 路径在没有按会话激活时仍然可用。key 缺失（重载竞态）按 seam 的强制读取规则大声失败，绝不静默取默认值；注册以 effect 作用域挂在服务的 fiber 上，因此 HMR 卸载会移除该 key。
+服务在 `ctx.sessionProjections`（必需注入）上注册唯一一个投影单元（`key: 'stage'`）。框架的 eager 驱动对每个已提交事件施加与 `foldStage` 相同的逐事件记录逻辑，外加边界机制与客户端计时所需的状态：最后一个 `request/header` 处的阶段（叙述判定）、开回合标志（空闲提交 vs 排队提交）、开回合的活跃时间窗口（在阶段记录处切分，因此回合中途切换只把记录之后的份额归给新阶段）、日志是否已携带阶段提示（仅一次的初始注入），以及表面头节点的种类——node 0 是否为完整切换替换必须跳过的受保护 `system/message`。读取（`stateOf`）只推进新增事件，且 base bundle 的投影缓存会做检查点，因此 resume 的会话至多重折叠一个尾部。这取代了早前版本每次读取都做的全日志扫描：harness 已废弃同步的全日志读取器（`Session.snapshotEvents()` 等），因为存储方向不再在内存中保留完整事件序列，而投影 seam 是官方认可的替代。该单元的 host 状态驱动服务读取；它的 `wire` view 发布客户端可见的阶段值——带 instruction 与可选显示别名的配置目录、已记录的旅程、每阶段的消息/工具/token/错误计数、每段访问的持久活跃回合毫秒数，以及当前未闭合回合的窗口。projection key 是 runtime 全局的（从 agent 预设挂载本插件会让 key 对整个 runtime 可见），因此侧栏阶段标签页以会话自身的持久阶段记录作为激活门槛：有记录时优先用该值，否则保留自己的事件窗口折叠回退（其他预设的会话，或尚未到第一个被接受 step 的会话），零 RPC 路径在没有按会话激活时仍然可用。key 缺失（重载竞态）按 seam 的强制读取规则大声失败，绝不静默取默认值；注册以 effect 作用域挂在服务的 fiber 上，因此 HMR 卸载会移除该 key。
 
 ### 解耦的判定器 seam
 
@@ -29,6 +29,8 @@ Status: implemented
 ### 阶段提示是对话消息，绝不是提示词 section
 
 当前阶段永不在系统提示词中：新会话在第一个被接受的 step 收到初始阶段提示，每次切换把新阶段的提示（`Current stage: <name>` 加上该阶段的 `instruction`）作为对话消息追加——仅对最后一个请求头描述另一阶段的用户驱动切换加前置的用户切换通知。子代会话跳过初始阶段提示：父会话已经派发了任务，注入配置的初始阶段（通常是 `route`，其指令让模型调用 `goto_stage`）会让子代死锁——`goto_stage` 的评审在子代上下文里没有用户可应答。因此切换不改变任何请求前缀，永不使 provider 的缓存前缀失效；阶段提示是普通的只追加对话增长。这与 plan mode 形成对比：其 `plan:policy` 是提示词 section，因为 plan 的布尔状态翻转很罕见，而阶段切换按设计会反复发生，所以反复发生的变化属于对话尾部。`stage:policy` 引导是运行时上下文贡献而非提示词 section；其模板可引用 `{{stage_current}}`/`{{stage_targets}}`，因为运行时上下文投影仅在其渲染文本变化时追加快照。
+
+**瞬态访问**是让误切换不进入模型上下文的例外。直接用户切换仍会立即提交（标签页与投影无需等待回合就能看到新阶段），其阶段提示就是持久记录。如果在那次访问产生任何消息、工具调用、token、错误或已结算的活跃回合时长之前又发生一次切换，下一条提示会通过对话尾部的一次 `surfaceOp: 'replace'` 范围替换 surface 尾部的瞬态提示串（通常只有一条），而不是追加在它们旁边。被放弃的指令因此不会进入下一次请求；append-only 日志仍保留中间记录，所以切换仍可审计，侧栏也仍把每次访问显示为独立的历史行。重写刻意收窄：只针对轻量记录（`Current stage:`，不是完整切换的 `Stage switched to` 通知）、没有未闭合回合、且提示仍构成 surface 尾部。有实际活动的访问、交接通知，或其提示后面还有其他 surface 节点的访问，都走正常追加路径。替换不会触碰受保护的 head，因为目标是尾部；提示已不在 surface 或不再是尾部时，代码回退到追加，而不是把指令移到更早的位置或遮蔽无关的 surface 内容。
 
 ### `goto_stage` 工具与经评审的切换
 
@@ -42,7 +44,7 @@ Status: implemented
 
 ### 边界冲刷归档模型可见表面
 
-下一个被接受的 in-turn pre-step 会追加新阶段的提示消息（其 notice summary 即已提交的阶段记录）；完整形态下，它先用 `surfaceOp: { op: 'replace', startSeq, endSeq }` 把会话系统提示之后的模型可见 surface 替换为一条携带交接指针与新阶段提示的消息——与 compaction checkpoint 使用相同的 surface 替换。harness 保护 surface 第 0 号节点上的 `system/message`，只允许恰好覆盖该节点的 `system/message` 重写它，因此覆盖该节点的范围会抛错、切换永远落不了地；head 是会话提示而非已归档历史，所以保留它、只遮蔽正文。surface 只剩 head 时改为追加提示。append-only 日志为人类转录保留已归档历史；只有派生的模型历史被遮蔽，本次 step 自身的用户消息落在提示之后。替换先于记录消息的 append，因此替换失败时已记录的阶段与 pending 切换都保持不变——观察不到半应用的切换。
+下一个被接受的 in-turn pre-step 会追加新阶段的提示消息（其 notice summary 即已提交的阶段记录）；完整形态下，它先用 `surfaceOp: { op: 'replace', startSeq, endSeq }` 把会话系统提示之后的模型可见 surface 替换为一条携带交接指针与新阶段提示的消息——与 compaction checkpoint 使用相同的 surface 替换。若这次轻量用户切换结束的是一个瞬态访问，同一个操作会替换对话尾部的那一条瞬态提示，而不是追加在它之后（见上文「瞬态访问」）。harness 保护 surface 第 0 号节点上的 `system/message`，只允许恰好覆盖该节点的 `system/message` 重写它，因此覆盖该节点的范围会抛错、切换永远落不了地；head 是会话提示而非已归档历史，所以保留它、只遮蔽正文。surface 只剩 head 时改为追加提示。append-only 日志为人类转录保留已归档历史；只有派生的模型历史被遮蔽，本次 step 自身的用户消息落在提示之后。替换先于记录消息的 append，因此替换失败时已记录的阶段与 pending 切换都保持不变——观察不到半应用的切换。
 
 ### 持久化的 full-transition 标记（`output.presentationMeta`）
 
@@ -50,7 +52,7 @@ Status: implemented
 
 ### `/stage` 命令对标 plan mode 的直接入口
 
-组合了 `ctx.commands` 时，本包注册 `/stage [stage|message]`。裸 `/stage` 读取当前阶段与阶段列表，不触碰状态。`/stage <name>` 是直接的用户切换：校验目标后，在空闲会话上立即应用，或在轮次中排队到下一个被接受的 in-turn pre-step（同一个 `pendingTransitions` 边界）；仅当最后一个请求头描述的是另一阶段时才叙述切换。阶段名之后的后缀会作为普通用户消息送入切换后阶段的上下文，对标 `/plan <message>`。手动切换按定义就是轻量切换——用户拥有这次变更，因此不写交接文档、不归档历史——这正是命令完全跳过评审、而不是委托给 `goto_stage` 的原因。
+组合了 `ctx.commands` 时，本包注册 `/stage [stage|message]`。裸 `/stage` 读取当前阶段与阶段列表，不触碰状态。`/stage <name>` 是直接的用户切换：校验目标后，在空闲会话上立即应用，或在轮次中排队到下一个被接受的 in-turn pre-step（同一个 `pendingTransitions` 边界）；仅当最后一个请求头描述的是另一阶段时才叙述切换。若这次切换结束的是一个未使用的瞬态访问，新提示会替换该访问的模型可见提示，而不是追加在它之后。阶段名之后的后缀会作为普通用户消息送入切换后阶段的上下文，对标 `/plan <message>`。手动切换按定义就是轻量切换——用户拥有这次变更，因此不写交接文档、不归档历史——这正是命令完全跳过评审、而不是委托给 `goto_stage` 的原因。
 
 ### 提示词文案单一 JSON 事实源，承载格式留在代码
 
@@ -76,8 +78,8 @@ Status: implemented
 
 ## 验证
 
-- 单元测试（手搭的 `ctx.plugin(...)` 套件）覆盖配置校验、阶段折叠（notice summary 及其优先级）——如今所有服务行为都经由注册的投影单元——提示词文案单一事实源钉住、策略上下文渲染与变量、判定器注册与移除、`goto_stage` schema 与校验链、持久化 full-transition 标记、评审回答规则与失败模式、呈现、token 阈值决策、交接路径按会话隔离与 sandbox policy 戳记、归档形态，以及 fiber 移除时 `stage:policy` 的清理。
-- 真实 Loader 组合套件通过 `@deepseek-ai/cordis-plugin-loader` 启动测试专用的 `cordis.yml`——只 mock 文件系统后端与评审回答——钉住产品可见接线：三注册表贡献（service、tool、command）、仅一次的初始阶段提示注入、存活的 `stage` 投影状态及其在卸载时的移除、从交接写入经评审与边界冲刷到持久化 `Stage switched to <stage>` notice 的完整 `goto_stage` 切换、`/stage` 空闲提交，以及干净卸载。
+- 单元测试（手搭的 `ctx.plugin(...)` 套件）覆盖配置校验、阶段折叠（notice summary 及其优先级）——如今所有服务行为都经由注册的投影单元——提示词文案单一事实源钉住、策略上下文渲染与变量、判定器注册与移除、`goto_stage` schema 与校验链、持久化 full-transition 标记、瞬态访问的 surface 遮蔽、评审回答规则与失败模式、呈现、token 阈值决策、交接路径按会话隔离与 sandbox policy 戳记、归档形态，以及 fiber 移除时 `stage:policy` 的清理。
+- 真实 Loader 组合套件通过 `@deepseek-ai/cordis-plugin-loader` 启动测试专用的 `cordis.yml`——只 mock 文件系统后端与评审回答——钉住产品可见接线：三注册表贡献（service、tool、command）、仅一次的初始阶段提示注入、存活的 `stage` 投影状态及其在卸载时的移除、从交接写入经评审与边界冲刷到持久化 `Stage switched to <stage>` notice 的完整 `goto_stage` 切换、`/stage` 空闲提交、瞬态空闲切换在保留日志记录的同时遮蔽模型表面、侧栏计时读取的每段访问活跃时长与未闭合回合窗口，以及干净卸载。
 - 评审弧与 surface 替换用真实 `Session` 与内存文件系统后端做包级测试；组装应用转录与专用 `stage-review` Web 渲染器属于延后工作。
 
 ## 后果

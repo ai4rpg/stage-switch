@@ -8,9 +8,9 @@ The plugin keeps logged, per-agent stage collaboration state with deployment-own
 
 ## Durable state
 
-The stage record rides the stage-switch plugin message every stage entry appends — the stage prompt (`Current stage: <name>`) or the handoff notice (`Stage switched to <name>`), both plain `user/message` events the stock harness event catalog already knows. Each record's source is producer-owned: `kind: 'stage-switch'` with the `notice` form and its summary. Records written by earlier releases come back from the harness's V3→V4 session conversion as `plugin:stage-switch`; `foldStage` accepts both kinds, so a resumed old session still lands on its recorded stage. `foldStage(events)` returns the stage from the last record (either notice shape) or `undefined`; the service folds to the configured `initial` stage (default the first stage) before the first record, so resume, fork, and compaction recover the stage directly from the session log. UIs observe committed switches through `session/event`.
+Every stage entry appends a durable notice: the stage prompt (`Current stage: <name>`) or the reviewed transition notice (`Stage switched to <name>`). The last notice is the current stage, so resume, fork, and compaction recover it; records from earlier releases are converted by the harness and still read.
 
-Reads go through the `stage` session-projection unit the service registers on `ctx.sessionProjections` (a required injection): the framework drives the same per-event fold over committed events and checkpoints the state, so every read costs O(new events) instead of a whole-log scan — the harness deprecated the synchronous whole-log readers, and this package makes zero calls to them. The unit's host state drives every service read; its `wire` view publishes the client-visible stage value — the configured catalog with instructions and optional display aliases, the recorded journey, and per-stage message/tool/token/error counters — so a client can render the journey without rescanning the log. The projection key is runtime-global (a deployment may mount this plugin from an agent preset, which makes the key visible to every session), so the sidebar stage tab treats the session's own durable stage record as the activation gate: it prefers the wire value once a record exists and otherwise keeps its own fold fallback (another preset's session, or a session before its first accepted step).
+`session/event` reports committed switches. The Host also publishes the stage view used by the sidebar, so the UI does not rescan the log; a session with no stage record sees the tab's empty state.
 
 `ctx.stage.current(session)` reads the stage in force. A reviewed transition is held pending and applied at the next accepted in-turn pre-step, so the current tool batch keeps its stage context and the tool result itself narrates the switch.
 
@@ -20,7 +20,12 @@ Reads go through the `stage` session-projection unit the service registers on `c
 
 ## Stage prompts and runtime context
 
-The current stage is **never a system-prompt section**: a fresh session receives the initial stage prompt on its first request, and every switch appends the new stage's prompt as a conversation message — `Current stage: <name>` plus that stage's `instruction` — so switching stages changes no request prefix and never invalidates the provider's cached prefix. **A subagent session skips the initial stage prompt**: the parent already routed its task, so injecting the configured initial stage (often `route`, whose instruction tells the model to call `goto_stage`) would deadlock the child — `goto_stage`'s review has no user to answer in a subagent context. The child still inherits `{{stage_current}}`/`{{stage_targets}}` and `stage:policy` through the normal projection (which stays empty without an eligibility predicate for the child). `stage:policy` (order 116) is a runtime-context contribution, not a prompt section: it renders the configured `section` template only while a predicate is true, and the runtime-context projection appends a snapshot only when its rendered text changes. The template may reference the `{{stage_current}}` and `{{stage_targets}}` variables; a stage switch that changes them appends one snapshot and still breaks no cached prefix.
+The current stage is **never a system-prompt section**: a fresh session receives the initial stage prompt on its first request, and every switch adds the new stage prompt as a conversation message — `Current stage: <name>` plus that stage's `instruction` — so switching stages changes no request prefix. If you switch away before using a stage and then switch again, that unused stage's prompt is left out of what the model sees; the append-only log keeps it for audit. **A subagent session skips the initial stage prompt**: the parent already routed its task, so injecting the configured initial stage (often `route`, whose instruction tells the model to call `goto_stage`) would deadlock the child — `goto_stage`'s review has no user to answer in a subagent context. The child still inherits `{{stage_current}}`/`{{stage_targets}}` and `stage:policy` through the normal projection. `stage:policy` is a runtime-context contribution, not a prompt section: it renders the configured `section` template only while a predicate is true, and it may reference the `{{stage_current}}` and `{{stage_targets}}` variables.
+
+```markdown
+Current stage: explore
+Explore the problem space and present a plan.
+```
 
 ## The `goto_stage` tool
 
@@ -34,7 +39,7 @@ Below the threshold a transition is **light**: `handoff` is optional, nothing is
 
 ## The `/stage` command
 
-When `ctx.commands` is composed, the package registers `/stage [stage|message]`. Bare `/stage` shows the current stage and the configured stage list without touching state. `/stage <name>` is a direct user switch: it validates the target, applies it immediately on an idle session or queues it for the next accepted in-turn pre-step during a turn, and appends the new stage's prompt (with a user-switch notice only when the last request header described a different stage). Any text after the stage name is steered as an ordinary user message into the switched stage's context, mirroring `/plan <message>`. A manual switch is a **light** transition: it never writes a handoff document and never archives history — the user owns the change, and the appended stage prompt tells the model what the new stage is for.
+When `ctx.commands` is composed, the package registers `/stage [stage|message]`. Bare `/stage` shows the current stage and the configured stage list without touching state. `/stage <name>` is a direct user switch: it validates the target, applies it immediately on an idle session or queues it for the next accepted in-turn pre-step during a turn, and adds the new stage's prompt (with a user-switch notice only when the last request header described a different stage); selecting the current stage does nothing. Any text after the stage name is steered as an ordinary user message into the switched stage's context, mirroring `/plan <message>`. A manual switch is a **light** transition: it never writes a handoff document and never archives history — the user owns the change, and the stage prompt tells the model what the new stage is for.
 
 ## The boundary flush
 
@@ -65,9 +70,9 @@ The next accepted in-turn pre-step appends the target stage's prompt message —
     minHandoffTokens: 4000
 ```
 
-`stages` is required, non-empty, and name-unique; names must match `[a-z][a-z0-9_-]*` so handoff file names stay safe. A stage may also declare an optional `alias` — a display label such as a localization, at most 60 characters. The alias is display-only: `name` stays the durable identity in the log, `/stage`, `goto_stage`, and every model-facing surface, while the alias rides the client wire view so the sidebar tab and its ambient surfaces can show the localized label. Each handoff document lands in `<handoffDir>/<session id>/<stage>.md` under the session cwd — the per-session directory keeps sessions that share a workspace from overwriting each other's documents. `section` is required and non-empty. `handoffDir` defaults to `handoff`; `initial` defaults to the first stage and must name a configured stage; `minHandoffTokens` is optional and must be non-negative; `language` selects the review-dialog language — `en` (default) or `zh`, the Chinese review-dialog dictionary (see below). Unknown keys fail at load.
+`stages` is required, non-empty, and name-unique; names must match `[a-z][a-z0-9_-]*` so handoff file names stay safe. A stage may also declare an optional `alias` — a display label such as a localization, at most 60 characters. The alias is display-only: `name` stays the durable identity in the log, `/stage`, `goto_stage`, and every model-facing surface, while the sidebar shows the alias where configured. Each handoff document lands in `<handoffDir>/<session id>/<stage>.md` under the session cwd — the per-session directory keeps sessions that share a workspace from overwriting each other's documents. `section` is required and non-empty. `handoffDir` defaults to `handoff`; `initial` defaults to the first stage and must name a configured stage; `minHandoffTokens` is optional and must be non-negative; `language` selects the review-dialog language — `en` (default) or `zh`, the Chinese review-dialog dictionary (see below). Unknown keys fail at load.
 
-A configured `minHandoffTokens` requires `@deepseek-ai/dsh-token-meter` in the composition; a `goto_stage` call fails loud when it is missing. The service also requires `@deepseek-ai/dsh-session-projection` for its projection-backed reads — the harness's base bundle mounts it, so standard compositions already provide it; activation fails loud without it.
+A configured `minHandoffTokens` requires `@deepseek-ai/dsh-token-meter` in the composition; a `goto_stage` call fails loud when it is missing. The service also requires `@deepseek-ai/dsh-session-projection` to publish stage state to the sidebar — the harness's base bundle mounts it, so standard compositions already provide it; activation fails loud without it.
 
 The package declares `engines.dsh` (`>=0.2.0-rc.2 <0.3.0-0`) as its DSH compatibility gate. DSH's app-boot and plugin-manager prefer that range over the dsh `peerDependencies`; the peers remain in the manifest because the Loader's profile resolution uses their names to route this plugin's host-package imports to the installation copy. The dsh peer ranges accept both the 0.2.0 line and the 0.2.1 prerelease line, so a host on either line passes npm's peer check. The engine range is the compatibility source, not the peer ranges; a dsh installation outside it is unsupported.
 
@@ -114,56 +119,13 @@ node node_modules/@ai4rpg/dsh-stage-switch/scripts/apply-zh.mjs
 
 This deep-merges the Chinese review strings over the installed `src/prompts.json`. The embedded fallback (`lib/prompts.defaults.js`) is unchanged — a stale install that loses the JSON still falls back to English. To revert the file-level merge: reinstall the package (`dsh plugin remove + add`), which restores the English `src/prompts.json`. **Re-run the script after every reinstall or upgrade** that resets the installed copy — or switch to the config route, which has no such step.
 
-## Model Experience
+## Model and cache effects
 
-### Stage guidance delivery
-
-#### What the model sees
-
-A fresh session's first request carries the initial stage prompt as a conversation message; every switch appends the new stage's prompt (`Current stage: <name>` plus the stage's `instruction`) as another message. **A subagent session skips this initial prompt** — the parent already routed its task, and the initial stage (often `route`, which instructs the model to call `goto_stage`) would deadlock the child, since `goto_stage`'s review has no user to answer in a subagent context. The system prompt never contains the current stage. While a predicate is true, the deployment's `section` template contributes to the runtime-context snapshot at order 116; if it references `{{stage_current}}` or `{{stage_targets}}`, those interpolate to the current stage at assembly time.
-
-##### Configuration example
-
-```markdown
-Current stage: explore
-Explore the problem space and present a plan.
-```
-
-#### Token effect
-
-The initial stage prompt costs the instruction's tokens once, in the first request; each switched stage prompt costs them once more as a conversation message. A subagent session pays neither — it skips the initial prompt and switches no stages. `stage:policy` costs the template's tokens only while a predicate is true, paid in the runtime-context snapshot rather than the system prompt.
-
-#### KV Cache effect
-
-The stage prompts are append-only conversation growth: switching stages appends a message and changes no request prefix, so the provider's cached prefix stays reusable across every stage. `stage:policy` re-renders each request, but the projection appends a snapshot only when its text changes (an eligibility flip, or a switch that changes stage-name variables); the cached system-prompt prefix is never touched. The tool catalog never changes.
-
-### Human command
-
-#### What the model sees
-
-`/stage` and its terminal results stay outside model history. A `/stage <name>` switch appends the new stage prompt, with a leading user-switch notice only when the last request header described the other stage; a switch that merely confirms the current stage appends nothing. A non-empty suffix after the stage name becomes one trimmed user text block through `agent.steer()` in the switched stage's context.
-
-#### Token effect
-
-Bare `/stage` and a suffix-free `/stage <name>` add no history tokens beyond the appended stage prompt (and the optional switch notice); a suffixed message costs the same history tokens as submitting that text separately.
-
-#### KV Cache effect
-
-The stage prompt and the optional user block are append-only conversation growth; the reusable request prefix is unchanged.
-
-### Transition tool
-
-#### What the model sees
-
-The `goto_stage` schema remains available in every stage; execution outside the current stage's rules fails with the corrective reason. An approved full transition returns `{ approved: true, stage, handoffPath }` and renders a confirmation naming the document; a light transition returns `{ approved: true, stage }`. Rejection remains a failed call carrying review feedback, and a dismissed review a failed call naming the user's takeover.
-
-#### Token effect
-
-The stable schema is paid according to ToolRuntime mode, and each handoff argument and review result remains in conversation history.
-
-#### KV Cache effect
-
-Stage transitions do not change the tool catalog; handoff arguments and review results extend the conversation normally.
+- The system prompt never contains the current stage: stage prompts are conversation messages. A switch adds the new prompt at the conversation tail, so the reusable request prefix and the tool catalog stay stable. An unused detour's prompt is replaced, so the model does not see it.
+- The initial stage prompt costs its instruction's tokens once per session; each switch costs the new instruction once as a conversation message. A prompt dropped this way leaves no lasting model-visible tokens, while the append-only log keeps the audit record.
+- `/stage` and its result stay outside model history; a suffix is steered as an ordinary user message. Handoff arguments and review results extend the conversation normally.
+- A subagent skips the initial stage prompt and does not switch stages.
+- `stage:policy` is runtime context rather than a system-prompt section; it contributes only while an eligibility predicate is true.
 
 ## Known Limitations and Deferred Work
 

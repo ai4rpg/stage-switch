@@ -8,9 +8,9 @@
 
 ## 持久状态
 
-阶段记录搭载在每次阶段进入都会追加的 stage-switch 插件消息上——阶段提示（`Current stage: <name>`）或交接提示（`Stage switched to <name>`），都是官方 harness 事件目录已知的普通 `user/message`。每条记录的 source 为生产者自有：`kind: 'stage-switch'`，`notice` 形态并携带 summary。更早版本写入的记录经 harness 的 V3→V4 会话转换后以 `plugin:stage-switch` 返回；`foldStage` 同时接受两种 kind，因此旧会话 resume 仍落在其记录的阶段上。`foldStage(events)` 返回最后一条记录的阶段，无记录时为 `undefined`；服务在第一条记录之前折叠到配置的 `initial` 阶段（默认第一个阶段），因此 resume、fork 与 compaction 直接从会话日志恢复阶段。UI 通过 `session/event` 观察已提交的切换。
+每次阶段进入都会追加一条持久 notice：阶段提示（`Current stage: <name>`）或已评审的切换通知（`Stage switched to <name>`）。最后一条 notice 就是当前阶段，因此 resume、fork 与 compaction 都能恢复它；更早版本写入的记录经 harness 转换后仍可读取。
 
-读取经由服务注册在 `ctx.sessionProjections` 上的 `stage` 会话投影单元（必需注入）：由框架对已提交事件驱动同一套逐事件折叠并做检查点，因此每次读取只花 O(新增事件) 而不是全量扫描日志——harness 已废弃同步的全日志读取器，本包对它们的调用数为零。该单元的 host 状态驱动服务的全部读取；它的 `wire` view 发布客户端可见的阶段值——带 instruction 与可选显示别名的配置目录、已记录的旅程、每阶段的消息/工具/token/错误计数——客户端无需重扫日志即可渲染旅程。projection key 是 runtime 全局的（部署可以从 agent 预设挂载本插件，因而该 key 对整个 runtime 可见），因此侧栏阶段标签页以会话自身的持久阶段记录作为激活门槛：有记录时优先用 wire 值，没有时保留自己的折叠回退（其他预设的会话，或尚未到第一个被接受 step 的会话）。
+`session/event` 报告已提交的切换。Host 还向侧栏发布阶段视图，因此 UI 无需重扫日志；没有阶段记录的会话看到标签页空状态。
 
 `ctx.stage.current(session)` 读取当前阶段。已评审的切换保持 pending，在下一个被接受的 in-turn pre-step 应用，因此当前工具批次保持其阶段上下文，切换由工具结果自身叙述。
 
@@ -20,7 +20,12 @@
 
 ## 阶段提示与运行时上下文
 
-当前阶段**绝不是系统提示词 section**：新会话在首个请求收到初始阶段提示，每次切换把新阶段的提示作为对话消息追加——`Current stage: <name>` 加上该阶段的 `instruction`——因此切换阶段不改变任何请求前缀，永不使 provider 的缓存前缀失效。**子代会话跳过初始阶段提示**：父会话已经派发了任务，注入配置的初始阶段（通常是 `route`，其指令让模型调用 `goto_stage`）会让子代死锁——`goto_stage` 的评审在子代上下文里没有用户可应答。子代仍通过正常投影继承 `{{stage_current}}`/`{{stage_targets}}` 和 `stage:policy`（没有判定器时这些投影为空）。`stage:policy`（order 116）是运行时上下文贡献，而非提示词 section：仅在判定器为 true 时渲染配置的 `section` 模板，运行时上下文投影仅在其渲染文本变化时追加快照。模板可引用 `{{stage_current}}` 与 `{{stage_targets}}` 变量；改变它们的阶段切换追加一条快照，仍不破坏缓存前缀。
+当前阶段**绝不是系统提示词 section**：新会话在首个请求收到初始阶段提示，每次切换把新阶段的提示作为对话消息添加——`Current stage: <name>` 加上该阶段的 `instruction`——因此切换阶段不改变任何请求前缀。若你在使用某个阶段之前就切走、随后再次切换，这个未使用阶段的提示不会出现在模型看到的内容里；append-only 日志仍保留它供审计。**子代会话跳过初始阶段提示**：父会话已经派发了任务，注入配置的初始阶段（通常是 `route`，其指令让模型调用 `goto_stage`）会让子代死锁——`goto_stage` 的评审在子代上下文里没有用户可应答。子代仍通过正常投影继承 `{{stage_current}}`/`{{stage_targets}}` 和 `stage:policy`。`stage:policy` 是运行时上下文贡献，而非提示词 section：仅在判定器为 true 时渲染配置的 `section` 模板，模板可引用 `{{stage_current}}` 与 `{{stage_targets}}` 变量。
+
+```markdown
+Current stage: explore
+Explore the problem space and present a plan.
+```
 
 ## `goto_stage` 工具
 
@@ -34,7 +39,7 @@
 
 ## `/stage` 命令
 
-组合了 `ctx.commands` 时，本包注册 `/stage [stage|message]`。裸 `/stage` 显示当前阶段与已配置的阶段列表，不触碰状态。`/stage <name>` 是直接的用户切换：校验目标后，在空闲会话上立即应用，或在轮次中排队到下一个被接受的 in-turn pre-step，并追加新阶段的提示（仅当最后一个请求头描述的是另一阶段时才带用户切换通知前缀）。阶段名之后的任何文本都会作为普通用户消息通过 `agent.steer()` 送入切换后阶段的上下文，对标 `/plan <message>`。手动切换是**轻量**切换：永不写交接文档、永不归档历史——用户拥有这次变更，追加的阶段提示会告诉模型新阶段的用途。
+组合了 `ctx.commands` 时，本包注册 `/stage [stage|message]`。裸 `/stage` 显示当前阶段与已配置的阶段列表，不触碰状态。`/stage <name>` 是直接的用户切换：校验目标后，在空闲会话上立即应用，或在轮次中排队到下一个被接受的 in-turn pre-step，并添加新阶段的提示（仅当最后一个请求头描述的是另一阶段时才带用户切换通知前缀）；选择当前阶段不做任何改动。阶段名之后的任何文本都会作为普通用户消息通过 `agent.steer()` 送入切换后阶段的上下文，对标 `/plan <message>`。手动切换是**轻量**切换：永不写交接文档、永不归档历史——用户拥有这次变更，阶段提示会告诉模型新阶段的用途。
 
 ## 边界冲刷
 
@@ -65,9 +70,9 @@
     minHandoffTokens: 4000
 ```
 
-`stages` 必填、非空、名称唯一；名称必须匹配 `[a-z][a-z0-9_-]*`，以保证交接文件名安全。阶段还可声明可选的 `alias`——显示用标签（例如本地化名称），最长 60 个字符。别名只用于显示：`name` 始终是日志、`/stage`、`goto_stage` 以及所有模型可见面的持久化身份，别名随客户端 wire view 下发，供侧栏标签页及其环境化表面显示本地化标签。每份交接文档落在会话 cwd 下的 `<handoffDir>/<会话 id>/<stage>.md`——按会话分目录让共享同一工作区的会话互不覆盖彼此的文档。`section` 必填且非空。`handoffDir` 默认 `handoff`；`initial` 默认第一个阶段且必须命名已配置的阶段；`minHandoffTokens` 可选且必须非负；`language` 选择评审弹窗语言——`en`（默认）或 `zh`，即中文评审弹窗词典（见下文）。未知 key 在加载时失败。
+`stages` 必填、非空、名称唯一；名称必须匹配 `[a-z][a-z0-9_-]*`，以保证交接文件名安全。阶段还可声明可选的 `alias`——显示用标签（例如本地化名称），最长 60 个字符。别名只用于显示：`name` 始终是日志、`/stage`、`goto_stage` 以及所有模型可见面的持久化身份，侧栏在配置了别名时显示别名。每份交接文档落在会话 cwd 下的 `<handoffDir>/<会话 id>/<stage>.md`——按会话分目录让共享同一工作区的会话互不覆盖彼此的文档。`section` 必填且非空。`handoffDir` 默认 `handoff`；`initial` 默认第一个阶段且必须命名已配置的阶段；`minHandoffTokens` 可选且必须非负；`language` 选择评审弹窗语言——`en`（默认）或 `zh`，即中文评审弹窗词典（见下文）。未知 key 在加载时失败。
 
-配置了 `minHandoffTokens` 时，组合中需要 `@deepseek-ai/dsh-token-meter`；缺失时 `goto_stage` 调用会大声失败。服务的投影读取还需要 `@deepseek-ai/dsh-session-projection`——harness 的 base bundle 已挂载它，因此标准组合天然具备；缺失时激活阶段即大声失败。
+配置了 `minHandoffTokens` 时，组合中需要 `@deepseek-ai/dsh-token-meter`；缺失时 `goto_stage` 调用会大声失败。服务还需要 `@deepseek-ai/dsh-session-projection` 才能向侧栏发布阶段状态——harness 的 base bundle 已挂载它，因此标准组合天然具备；缺失时激活阶段即大声失败。
 
 本包声明 `engines.dsh`（`>=0.2.0-rc.2 <0.3.0-0`）作为 DSH 兼容门禁。DSH 的 app-boot 与 plugin-manager 优先使用该区间而不是 dsh `peerDependencies`；peers 仍保留在 manifest 中，因为 Loader 的 profile resolution 要用这些名字把本插件的宿主包 import 路由到安装副本。dsh peer 区间同时接受 0.2.0 线与 0.2.1 预发布线，因此任一条线上的宿主都能通过 npm 的 peer 检查。兼容性以 engine 区间为准，而不是 peer 区间；超出该区间的 dsh 安装不受支持。
 
@@ -114,56 +119,13 @@ node node_modules/@ai4rpg/dsh-stage-switch/scripts/apply-zh.mjs
 
 该脚本将中文评审文案深度合并到已装的 `src/prompts.json` 中。内嵌兜底（`lib/prompts.defaults.js`）不受影响——安装包丢失 JSON 文件时仍回退到英文。回退文件级合并：重装包（`dsh plugin remove + add`），恢复英文 `src/prompts.json`。**每次重装或升级后重新运行该脚本**——或改用配置路径，它没有这一步。
 
-## 模型体验
+## 模型与缓存影响
 
-### 阶段引导交付
-
-#### 模型看到什么
-
-新会话的首个请求把初始阶段提示作为对话消息携带；每次切换把新阶段的提示（`Current stage: <name>` 加上该阶段的 `instruction`）作为又一条消息追加。**子代会话跳过此初始提示**——父会话已经派发了任务，初始阶段（通常是 `route`，其指令让模型调用 `goto_stage`）会让子代死锁，因为 `goto_stage` 的评审在子代上下文里没有用户可应答。系统提示词永不包含当前阶段。当某判定器为 true 时，部署方的 `section` 模板在 order 116 贡献给运行时上下文快照；若它引用 `{{stage_current}}` 或 `{{stage_targets}}`，则组装时插值为当前阶段。
-
-##### 配置示例
-
-```markdown
-Current stage: explore
-Explore the problem space and present a plan.
-```
-
-#### Token 影响
-
-初始阶段提示只在首个请求花费一次 instruction 的 token；每个切换后的阶段提示作为对话消息再花费一次。子代会话两者都不花——它跳过初始提示，也不切换阶段。`stage:policy` 仅在判定器为 true 时花费模板的 token，付在运行时上下文快照中而非系统提示词。
-
-#### KV Cache 影响
-
-阶段提示是只追加的对话增长：切换阶段追加一条消息且不改变任何请求前缀，因此 provider 的缓存前缀在每次切换后仍可复用。`stage:policy` 每次请求都重新渲染，但投影仅在其文本变化时追加快照（可切换状态翻转，或改变阶段名变量的切换）；缓存的系统提示词前缀永不被触碰。工具目录永不改变。
-
-### 人工命令
-
-#### 模型看到什么
-
-`/stage` 及其终端结果不进模型历史。`/stage <name>` 切换会追加新阶段的提示，仅在最后一个请求头描述的是另一阶段时带前置的用户切换通知；仅确认当前阶段的切换不追加任何内容。阶段名之后的非空后缀会通过 `agent.steer()` 成为切换后阶段上下文中的一条修剪过的用户文本块。
-
-#### Token 影响
-
-裸 `/stage` 与无后缀的 `/stage <name>` 除追加的阶段提示（及可选切换通知）外不增加历史 token；带后缀的消息与单独提交该文本花费相同的历史 token。
-
-#### KV Cache 影响
-
-阶段提示与可选用户块都是只追加的对话增长；可复用请求前缀保持不变。
-
-### 切换工具
-
-#### 模型看到什么
-
-`goto_stage` schema 在每个阶段都可用；在当前阶段规则之外的执行会带着修正原因失败。已批准的完整切换返回 `{ approved: true, stage, handoffPath }`，并渲染指明文档的确认文本；轻量切换返回 `{ approved: true, stage }`。拒绝仍是携带评审反馈的失败调用，被放弃的评审是点名用户接手的失败调用。
-
-#### Token 影响
-
-稳定 schema 按 ToolRuntime 模式计费，每个交接参数与评审结果留在对话历史中。
-
-#### KV Cache 影响
-
-阶段切换不改变工具目录；交接参数与评审结果正常扩展对话。
+- 系统提示词永不包含当前阶段：阶段提示是对话消息。切换会把新提示加到对话尾部，因此可复用请求前缀与工具目录保持稳定。未使用的中转阶段提示会被替换，模型看不到它。
+- 初始阶段提示每个会话只花费一次 instruction 的 token；每次切换再为新的 instruction 花费一次。以这种方式被替换的提示不留下长期模型可见 token，append-only 日志仍保留审计记录。
+- `/stage` 及其结果不进模型历史；后缀会作为普通用户消息送入。交接参数与评审结果正常扩展对话。
+- 子代会话跳过初始阶段提示，也不切换阶段。
+- `stage:policy` 是运行时上下文，不是系统提示词 section；仅在判定器为 true 时贡献。
 
 ## 已知限制与延后工作
 

@@ -6,7 +6,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createElement } from 'react'
-import { cleanup, fireEvent, render } from '@testing-library/react'
+import { act, cleanup, fireEvent, render } from '@testing-library/react'
 import { makeTranslate, STAGE_ALIASES, STAGE_NAMES } from './helpers.ts'
 import { StageTitle } from '../src/client/StageTitle.tsx'
 import { StageDock } from '../src/client/StageDock.tsx'
@@ -111,5 +111,61 @@ describe('StageDock', () => {
       t,
     } as never))
     expect(container.querySelector('[data-stage-dock]')).toBeNull()
+  })
+
+  it('counts active turn time and freezes the pill while the session is idle', () => {
+    vi.useFakeTimers()
+    const START = 1_700_000_000_000
+    vi.setSystemTime(START)
+    try {
+      const live = {
+        stage: STAGE_NAMES.second,
+        seq: 2,
+        time: START - 60_000,
+        switched: true,
+        messages: 2,
+        tools: 1,
+        tokens: 10,
+        errors: 0,
+      }
+      const state: { wire: StageWireView, running: boolean } = {
+        wire: {
+          stage: STAGE_NAMES.second,
+          stages: wire.stages,
+          history: [{ ...live, time: START - 600_000, activeMs: 10_000 }, { ...live, activeMs: 60_000 }],
+          historyTruncated: false,
+          activeTurn: { since: START, through: START },
+        },
+        running: true,
+      }
+      const useProjection = (key: string): unknown => key === 'stage' ? state.wire : undefined
+      const useSession = <T,>(selector: (view: { running: boolean }) => T): T =>
+        selector({ running: state.running })
+      const element = () => createElement(StageDock, {
+        useProjection,
+        useSession,
+        openStage: vi.fn(),
+        t,
+      } as never)
+      const { container, rerender } = render(element())
+      const meta = (): string => container.querySelector('.ui-stage-dock-meta')?.textContent ?? ''
+
+      expect(meta()).toBe('1m')
+      act(() => { vi.advanceTimersByTime(5_000) })
+      expect(meta()).toBe('1m 05s')
+
+      state.wire = {
+        ...state.wire,
+        history: [state.wire.history[0]!, { ...live, activeMs: 65_000 }],
+        activeTurn: undefined,
+      }
+      state.running = false
+      rerender(element())
+      act(() => { vi.advanceTimersByTime(30_000) })
+      expect(meta()).toBe('1m 05s')
+    } finally {
+      cleanup()
+      vi.useRealTimers()
+    }
   })
 })

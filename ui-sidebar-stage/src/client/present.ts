@@ -11,6 +11,7 @@
 import type { StageWireView } from './wire.ts'
 import type { StageRecord } from './fold.ts'
 import type { StageView } from './store.ts'
+import type { StageActiveWindow, StageTiming } from './format.ts'
 
 /** One catalog entry with its deployment copy. */
 export interface StageCatalogEntry {
@@ -26,7 +27,7 @@ export function stageLabel(stage: { readonly name: string, readonly alias?: stri
 }
 
 /** One recorded stage visit, normalized for rendering. */
-export interface StageSegment {
+export interface StageSegment extends StageTiming {
   /** The stage this visit records (the durable name). */
   readonly stage: string
   /** The label to display for this visit: the catalog alias when configured. */
@@ -74,19 +75,23 @@ function segmentOf(
   entry: StageWireView['history'][number],
   catalog: readonly StageCatalogEntry[],
   live: boolean,
+  active: StageActiveWindow | undefined,
 ): StageSegment {
+  const configured = catalog.find(stage => stage.name === entry.stage)
   return {
     stage: entry.stage,
-    label: catalog.find(stage => stage.name === entry.stage)?.alias ?? entry.stage,
+    label: configured?.alias ?? entry.stage,
     seq: entry.seq,
     time: entry.time,
     switched: entry.switched,
-    instruction: catalog.find(stage => stage.name === entry.stage)?.instruction,
+    instruction: configured?.instruction,
     messages: entry.messages,
     tools: entry.tools,
     tokens: entry.tokens,
     errors: entry.errors,
     live,
+    ...entry.activeMs === undefined ? {} : { activeMs: entry.activeMs },
+    ...live && active !== undefined ? { active } : {},
   }
 }
 
@@ -131,7 +136,7 @@ export function presentStages(wire: StageWireView | undefined, folded: StageView
       alias === undefined ? { name, instruction } : { name, alias, instruction })
     if (wire.history.length > 0) {
       const segments = wire.history.map((entry, index) =>
-        segmentOf(entry, catalog, index === wire.history.length - 1))
+        segmentOf(entry, catalog, index === wire.history.length - 1, wire.activeTurn))
       const visited = new Set(wire.history.map(entry => entry.stage))
       const future = catalog.filter(stage => !visited.has(stage.name))
       return {

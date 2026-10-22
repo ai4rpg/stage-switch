@@ -20,7 +20,10 @@ export const STAGE_CSS = `
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 16px 16px 24px;
   color: var(--dsw-alias-label-primary);
   font-family: var(--dsw-font-family);
@@ -34,6 +37,21 @@ body[data-ds-dark-theme] .ui-stage-root {
 .ui-stage-root *::before,
 .ui-stage-root *::after {
   box-sizing: border-box;
+}
+
+/* The tab is a fixed-height column: everything except the journey keeps its
+   natural height, and the journey scrolls inside the remaining space. Without
+   this, a long visit history grew the root past the pane and clipped the
+   switch button and other tab content. A pane shorter than the fixed blocks
+   still overflows, so the root scrolls as a last resort (the journey keeps a
+   floor) instead of making the switch button unreachable. */
+.ui-stage-hero,
+.ui-stage-metrics,
+.ui-stage-section,
+.ui-stage-note,
+.ui-stage-failure,
+.ui-stage-switch {
+  flex: none;
 }
 
 /* ---------- empty state ---------- */
@@ -531,6 +549,16 @@ body[data-ds-dark-theme] .ui-stage-root {
   color: var(--dsw-alias-label-tertiary);
   font-size: 10px;
   line-height: 15px;
+}
+
+.ui-stage-journey-scroll {
+  flex: 1 1 auto;
+  min-height: 120px;
+  margin-right: -2px;
+  padding-right: 2px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .ui-stage-journey {

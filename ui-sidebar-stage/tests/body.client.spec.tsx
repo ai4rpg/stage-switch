@@ -55,7 +55,7 @@ function wireView(): StageWireView {
     stage: STAGE_NAMES.second,
     stages: CATALOG,
     history: [
-      { stage: STAGE_NAMES.first, seq: 1, time: NOW - 900_000, switched: false, messages: 4, tools: 2, tokens: 800, errors: 0 },
+      { stage: STAGE_NAMES.first, seq: 1, time: NOW - 900_000, switched: false, messages: 4, tools: 2, tokens: 800, errors: 0, activeMs: 5_000 },
       { stage: STAGE_NAMES.second, seq: 2, time: NOW - 60_000, switched: true, messages: 3, tools: 2, tokens: 1_200, errors: 0 },
     ],
     historyTruncated: false,
@@ -169,6 +169,37 @@ describe('StageBody', () => {
     expect(rows[2]?.textContent).toContain(zh.notVisited)
     expect(rows[3]?.textContent).toContain(zh.notVisited)
     expect(container.querySelector('.ui-stage-section-count')?.textContent).toBe('2 / 4')
+    // The journey is its own scroll region; the switch button and the rest
+    // of the tab stay outside it instead of being pushed out by many rows.
+    const scroll = container.querySelector('[data-stage-journey-scroll]')
+    expect(scroll?.querySelector('[data-stage-history]')).not.toBeNull()
+    expect(scroll?.querySelector('[data-stage-switch]')).toBeNull()
+  })
+
+  it('keeps a zero-use detour in the journey instead of removing it', () => {
+    const wire: StageWireView = {
+      stage: STAGE_NAMES.first,
+      stages: CATALOG,
+      history: [
+        { stage: STAGE_NAMES.first, seq: 1, time: NOW - 120_000, switched: false, messages: 2, tools: 1, tokens: 20, errors: 0, activeMs: 5_000 },
+        { stage: STAGE_NAMES.second, seq: 2, time: NOW - 60_000, switched: false, messages: 0, tools: 0, tokens: 0, errors: 0, activeMs: 0 },
+        { stage: STAGE_NAMES.first, seq: 3, time: NOW - 10_000, switched: false, messages: 1, tools: 0, tokens: 5, errors: 0, activeMs: 1_000 },
+      ],
+      historyTruncated: false,
+    }
+    const { container } = bodyOf({ wire })
+    const rows = [...container.querySelectorAll('[data-stage-history] li')]
+    // All three recorded visits plus the two unvisited catalog stages. The
+    // empty detour must stay visible; hiding it also removed its stage from
+    // the "next stops" list, which made the journey look shorter.
+    expect(rows).toHaveLength(5)
+    expect(rows[0]?.textContent).toContain(STAGE_NAMES.first)
+    expect(rows[1]?.textContent).toContain(STAGE_ALIASES.second)
+    expect(rows[2]?.textContent).toContain(STAGE_NAMES.first)
+    expect(rows[2]?.getAttribute('aria-current')).toBe('step')
+    const values = [...container.querySelectorAll('.ui-stage-metric-value')].map(node => node.textContent)
+    expect(values).toEqual(['1', '0', '5'])
+    expect(container.querySelector('.ui-stage-section-count')?.textContent).toBe('3 / 4')
   })
 
   it('falls back to the client fold: visited only, with the partial-history note', () => {
@@ -190,6 +221,9 @@ describe('StageBody', () => {
     const options = [...container.querySelectorAll<HTMLButtonElement>('[data-stage-option]')]
     expect(options.map(option => option.getAttribute('data-stage-option')))
       .toEqual([STAGE_NAMES.first, STAGE_NAMES.second, STAGE_NAMES.third, STAGE_NAMES.target])
+    // A visited row's duration is durable active-turn time, not the wall-clock
+    // span between records (the first visit is 15 minutes old, 5s active).
+    expect(options[0]?.textContent).toContain('5s')
     // Aliased rows show the label plus the durable name as a hint; the data
     // attribute (the switch target) stays the name.
     expect(options[1]?.textContent).toContain(STAGE_ALIASES.second)
@@ -225,6 +259,18 @@ describe('StageBody', () => {
       fireEvent.click(options[0]!)
     })
     expect(switchStage).toHaveBeenCalledWith(STAGE_NAMES.third)
+  })
+
+  it('falls back to the wall-clock span for a wire without active timing', async () => {
+    const legacy = wireView()
+    const history = legacy.history.map((entry, index) =>
+      index === 0 ? { ...entry, activeMs: undefined } : entry)
+    const { container } = bodyOf({ wire: { ...legacy, history } })
+    await openPalette(container)
+    const options = [...container.querySelectorAll<HTMLButtonElement>('[data-stage-option]')]
+    // The first visit spans 14 wall-clock minutes up to the next record; the
+    // legacy host carries no active-turn time to show instead.
+    expect(options[0]?.textContent).toContain('14m')
   })
 
   it('switches directly from a journey row and shows the requested note while the record is queued', async () => {
@@ -290,5 +336,128 @@ describe('StageBody', () => {
       fireEvent.keyDown(container.querySelector('.ui-stage-palette')!, { key: 'Escape' })
     })
     expect(container.querySelector('[data-stage-menu]')).toBeNull()
+  })
+
+  it('counts active turn time: a stopped session freezes the clock and resumes from there', async () => {
+    vi.useFakeTimers()
+    const START = 1_700_000_000_000
+    vi.setSystemTime(START)
+    try {
+      const live = {
+        stage: STAGE_NAMES.second,
+        seq: 2,
+        time: START - 60_000,
+        switched: true,
+        messages: 0,
+        tools: 0,
+        tokens: 0,
+        errors: 0,
+      }
+      const state: { wire: StageWireView, running: boolean } = {
+        wire: {
+          stage: STAGE_NAMES.second,
+          stages: CATALOG,
+          history: [
+            { stage: STAGE_NAMES.first, seq: 1, time: START - 600_000, switched: false, messages: 0, tools: 0, tokens: 0, errors: 0, activeMs: 10_000 },
+            { ...live, activeMs: 60_000 },
+          ],
+          historyTruncated: false,
+          activeTurn: { since: START, through: START },
+        },
+        running: true,
+      }
+      const folded: StageView = { current: STAGE_NAMES.second, records: [] }
+      const useStage = <T,>(selector: (view: StageView) => T): T => selector(folded)
+      const useProjection = (key: string): unknown => key === 'stage' ? state.wire : undefined
+      const useSession = <T,>(selector: (view: { running: boolean, hasMore: boolean }) => T): T =>
+        selector({ running: state.running, hasMore: false })
+      const element = () => createElement(StageBody, {
+        useStage,
+        useProjection,
+        useSession,
+        switchStage: () => Promise.resolve({ ok: true } as StageSwitchOutcome),
+        t,
+      } as never)
+      const { container, rerender } = render(element())
+      const clock = (): string => container.querySelector('.ui-stage-in-stage')?.textContent ?? ''
+
+      expect(clock()).toContain('1m')
+      act(() => { vi.advanceTimersByTime(5_000) })
+      expect(clock()).toContain('1m 05s')
+
+      // The durable turn/end settles the stopped span; the session is idle.
+      state.wire = {
+        ...state.wire,
+        history: [state.wire.history[0]!, { ...live, activeMs: 65_000 }],
+        activeTurn: undefined,
+      }
+      state.running = false
+      rerender(element())
+      expect(clock()).toContain('1m 05s')
+      act(() => { vi.advanceTimersByTime(30_000) })
+      expect(clock()).toContain('1m 05s')
+
+      // The next turn opens at the current instant; idle time never counts.
+      state.wire = { ...state.wire, activeTurn: { since: Date.now(), through: Date.now() } }
+      state.running = true
+      rerender(element())
+      act(() => { vi.advanceTimersByTime(5_000) })
+      expect(clock()).toContain('1m 10s')
+    } finally {
+      cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('freezes the legacy wall-clock fallback while idle and jumps forward on resume', () => {
+    vi.useFakeTimers()
+    const START = 1_700_000_000_000
+    vi.setSystemTime(START)
+    try {
+      // A host that predates active-turn timing: no `activeMs`, no `activeTurn`.
+      // The documented degradation is a wall-clock span that stops refreshing
+      // while idle (no ticker) and jumps to the true span on resume. This test
+      // pins that tradeoff so a later "fix" does not silently reintroduce
+      // idle time into the active clock.
+      const legacy: StageWireView = {
+        stage: STAGE_NAMES.second,
+        stages: CATALOG,
+        history: [
+          { stage: STAGE_NAMES.first, seq: 1, time: START - 600_000, switched: false, messages: 0, tools: 0, tokens: 0, errors: 0 },
+          { stage: STAGE_NAMES.second, seq: 2, time: START - 60_000, switched: true, messages: 0, tools: 0, tokens: 0, errors: 0 },
+        ],
+        historyTruncated: false,
+      }
+      const state = { running: false }
+      const folded: StageView = { current: STAGE_NAMES.second, records: [] }
+      const useStage = <T,>(selector: (view: StageView) => T): T => selector(folded)
+      const useProjection = (key: string): unknown => key === 'stage' ? legacy : undefined
+      const useSession = <T,>(selector: (view: { running: boolean, hasMore: boolean }) => T): T =>
+        selector({ running: state.running, hasMore: false })
+      const element = () => createElement(StageBody, {
+        useStage,
+        useProjection,
+        useSession,
+        switchStage: () => Promise.resolve({ ok: true } as StageSwitchOutcome),
+        t,
+      } as never)
+      const { container, rerender } = render(element())
+      const clock = (): string => container.querySelector('.ui-stage-in-stage')?.textContent ?? ''
+
+      expect(clock()).toContain('1m')
+      act(() => { vi.advanceTimersByTime(30_000) })
+      expect(clock()).toContain('1m')
+
+      // Resuming starts the ticker: the span jumps to the wall-clock reading
+      // and then ticks, which is the acknowledged legacy behavior.
+      state.running = true
+      rerender(element())
+      expect(clock()).toContain('1m 30s')
+      act(() => { vi.advanceTimersByTime(5_000) })
+      expect(clock()).toContain('1m 35s')
+    } finally {
+      cleanup()
+      vi.useRealTimers()
+    }
   })
 })

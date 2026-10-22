@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context, Service } from '@deepseek-ai/cordis'
-import { createAssistantMessage, createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
+import { createAssistantMessage, createDeveloperMessage, createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import SystemPrompt, { renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -20,7 +20,7 @@ import { stageSwitchPrompts, formatPrompt, resolveStageSwitchPrompts } from '../
 import { DEFAULT_STAGE_SWITCH_PROMPTS } from '../src/prompts.defaults.ts'
 import {
   APPROVE_LABEL, KEEP_LABEL, MemoryFs, STAGE_ALIAS, STAGE_CONFIG, STAGE_FIRST, STAGE_NAMES, STAGE_SECOND, STAGE_THIRD, TEST_STAGES,
-  assembleFor, boundary, openTurn, promptTexts, stageInstruction,
+  assembleFor, boundary, openTurn, promptTexts, stageInstruction, stageNoticeSummaries,
 } from './helpers/shared.ts'
 
 /** Test-only foreign producer: a notice another plugin owns must never fold. */
@@ -454,6 +454,177 @@ describe('stage prompt messages', () => {
     const assembly = await assembleFor(ctx, agent)
     expect(assembly.variables['stage_current']).toBe(STAGE_FIRST)
     expect(assembly.variables['stage_targets']).toBe(STAGE_NAMES.slice(1).join(', '))
+  })
+})
+
+describe('transient stage visits', () => {
+  it('shadows an unused stage prompt when the user switches again', async () => {
+    const ctx = await setup()
+    const agent = await agentWithSession(ctx, 'transient-switch')
+    const session = agent.session
+
+    expect(ctx.stage.set(agent, STAGE_SECOND)).toBe('committed')
+    expect(promptTexts(agent)).toHaveLength(1)
+    expect(promptTexts(agent)[0]).toContain(`Current stage: ${STAGE_SECOND}`)
+
+    expect(ctx.stage.set(agent, STAGE_FIRST)).toBe('committed')
+    const texts = promptTexts(agent)
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain(`Current stage: ${STAGE_FIRST}`)
+    expect(texts.some(text => text.includes(`Current stage: ${STAGE_SECOND}`))).toBe(false)
+    // The shadowed prompt stays in the append-only log, but not on the
+    // model-visible surface; the projection still records both entries.
+    expect(session.surface.nodes).toHaveLength(1)
+    expect(stageNoticeSummaries(session)).toEqual([
+      `Current stage: ${STAGE_SECOND}`,
+      `Current stage: ${STAGE_FIRST}`,
+    ])
+    const wire = ctx.sessionProjections.snapshot(session).values.stage as StageWireView
+    expect(wire.history.map(entry => entry.stage)).toEqual([STAGE_SECOND, STAGE_FIRST])
+    expect(wire.history[0]).toMatchObject({
+      switched: false, messages: 0, tools: 0, tokens: 0, errors: 0, activeMs: 0,
+    })
+    expect(foldStage(session.snapshotEvents())).toBe(STAGE_FIRST)
+  })
+
+  it('shadows a whole trailing run of unused stage prompts', async () => {
+    const ctx = await setup()
+    const agent = await agentWithSession(ctx, 'transient-chain')
+    const session = agent.session
+
+    expect(ctx.stage.set(agent, STAGE_SECOND)).toBe('committed')
+    expect(ctx.stage.set(agent, STAGE_THIRD)).toBe('committed')
+    expect(ctx.stage.set(agent, STAGE_FIRST)).toBe('committed')
+
+    const texts = promptTexts(agent)
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain(`Current stage: ${STAGE_FIRST}`)
+    expect(texts.some(text => text.includes(`Current stage: ${STAGE_SECOND}`))).toBe(false)
+    expect(texts.some(text => text.includes(`Current stage: ${STAGE_THIRD}`))).toBe(false)
+    expect(session.surface.nodes).toHaveLength(1)
+    const wire = ctx.sessionProjections.snapshot(session).values.stage as StageWireView
+    expect(wire.history.map(entry => entry.stage)).toEqual([STAGE_SECOND, STAGE_THIRD, STAGE_FIRST])
+    expect(foldStage(session.snapshotEvents())).toBe(STAGE_FIRST)
+  })
+
+  it('replaces a contiguous tail of unused prompts with one surface range', async () => {
+    const ctx = await setup()
+    const agent = await agentWithSession(ctx, 'transient-range')
+    const session = agent.session
+    const append = (stage: string): void => {
+      session.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: `Current stage: ${stage}\n${stageInstruction(stage)}` }],
+        source: { kind: 'stage-switch', form: 'notice', summary: `Current stage: ${stage}` },
+      }), { surfaceOp: 'append' })
+    }
+    append(STAGE_SECOND)
+    append(STAGE_THIRD)
+    expect(session.surface.nodes).toHaveLength(2)
+
+    expect(ctx.stage.set(agent, STAGE_FIRST)).toBe('committed')
+    expect(session.surface.nodes).toHaveLength(1)
+    const texts = promptTexts(agent)
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain(`Current stage: ${STAGE_FIRST}`)
+    expect(texts.some(text => text.includes(`Current stage: ${STAGE_SECOND}`))).toBe(false)
+    expect(texts.some(text => text.includes(`Current stage: ${STAGE_THIRD}`))).toBe(false)
+    expect(stageNoticeSummaries(session)).toEqual([
+      `Current stage: ${STAGE_SECOND}`,
+      `Current stage: ${STAGE_THIRD}`,
+      `Current stage: ${STAGE_FIRST}`,
+    ])
+  })
+
+  it('keeps a stage prompt the stage actually used', async () => {
+    const ctx = await setup()
+    const agent = await agentWithSession(ctx, 'transient-used')
+    const session = agent.session
+
+    expect(ctx.stage.set(agent, STAGE_SECOND)).toBe('committed')
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'hello from the transient stage' }],
+      source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    expect(ctx.stage.set(agent, STAGE_FIRST)).toBe('committed')
+
+    const texts = promptTexts(agent)
+    expect(texts.some(text => text.includes('hello from the transient stage'))).toBe(true)
+    expect(texts.some(text => text.includes(`Current stage: ${STAGE_SECOND}`))).toBe(true)
+    expect(texts.at(-1)).toContain(`Current stage: ${STAGE_FIRST}`)
+    expect(session.surface.nodes).toHaveLength(3)
+  })
+
+  it('never rewrites a full-transition handoff notice', async () => {
+    const ctx = await setup()
+    const agent = await agentWithSession(ctx, 'transient-handoff')
+    const session = agent.session
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: `Stage switched to ${STAGE_SECOND}\n${stageInstruction(STAGE_SECOND)}` }],
+      source: { kind: 'stage-switch', form: 'notice', summary: `Stage switched to ${STAGE_SECOND}` },
+    }), { surfaceOp: 'append' })
+
+    expect(ctx.stage.set(agent, STAGE_FIRST)).toBe('committed')
+    const texts = promptTexts(agent)
+    expect(texts.some(text => text.includes(`Stage switched to ${STAGE_SECOND}`))).toBe(true)
+    expect(texts.at(-1)).toContain(`Current stage: ${STAGE_FIRST}`)
+    expect(session.surface.nodes).toHaveLength(2)
+  })
+
+  it('appends when another plugin appended a surface node after the transient prompt', async () => {
+    const ctx = await setup()
+    const agent = await agentWithSession(ctx, 'transient-foreign-tail')
+    const session = agent.session
+
+    expect(ctx.stage.set(agent, STAGE_SECOND)).toBe('committed')
+    // A developer notice another plugin owns: it counts for no stage metric,
+    // so the visit still looks unused, but its prompt is no longer the tail.
+    session.append('developer/message', {
+      turn: 0,
+      step: 0,
+      message: createDeveloperMessage({
+        content: [{ type: 'text', text: 'foreign developer notice' }],
+        source: { kind: 'other-plugin' },
+      }),
+    }, { surfaceOp: 'append' })
+
+    expect(ctx.stage.set(agent, STAGE_FIRST)).toBe('committed')
+    // Shadowing only the tail would have moved the stage instruction above the
+    // foreign notice, and shadowing both would drop unrelated content, so the
+    // prompt appends instead: the model sees the detour, never a reordering.
+    const texts = promptTexts(agent)
+    expect(texts.some(text => text.includes(`Current stage: ${STAGE_SECOND}`))).toBe(true)
+    expect(texts.at(-1)).toContain(`Current stage: ${STAGE_FIRST}`)
+    expect(session.surface.nodes).toHaveLength(3)
+  })
+
+  it('keeps a visit whose only trace is settled turn time', async () => {
+    const ctx = await setup()
+    const agent = await agentWithSession(ctx, 'transient-settled-time')
+    const session = agent.session
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    try {
+      // A mid-turn switch can leave a visit with turn time but no counters (a
+      // turn started under the previous stage and ended right after the
+      // switch). Settled time is use: its prompt must stay.
+      expect(ctx.stage.set(agent, STAGE_SECOND)).toBe('committed')
+      clock.mockReturnValue(2_000)
+      session.append('turn/start', { turn: 1 })
+      clock.mockReturnValue(5_000)
+      session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+
+      const wire = ctx.sessionProjections.snapshot(session).values.stage as StageWireView
+      expect(wire.history[0]).toMatchObject({
+        stage: STAGE_SECOND, messages: 0, tools: 0, tokens: 0, errors: 0, activeMs: 3_000,
+      })
+
+      expect(ctx.stage.set(agent, STAGE_FIRST)).toBe('committed')
+      const texts = promptTexts(agent)
+      expect(texts.some(text => text.includes(`Current stage: ${STAGE_SECOND}`))).toBe(true)
+      expect(texts.at(-1)).toContain(`Current stage: ${STAGE_FIRST}`)
+      expect(session.surface.nodes).toHaveLength(2)
+    } finally {
+      clock.mockRestore()
+    }
   })
 })
 
@@ -1222,5 +1393,66 @@ describe('stage projection wire view', () => {
     expect(first.seq).toBeLessThan(second.seq)
     expect(first.time).toBeLessThanOrEqual(second.time)
     expect(after.historyTruncated).toBe(false)
+  })
+
+  it('publishes active-turn time per visit and freezes the clock outside turns', async () => {
+    const ctx = await setup()
+    const agent = await agentWithSession(ctx, 'wire-timing')
+    const session = agent.session
+    const read = (): StageWireView =>
+      ctx.sessionProjections.snapshot(session).values.stage as StageWireView
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    const appendRecord = (stage: string, switched: boolean): void => {
+      const summary = `${switched ? 'Stage switched to' : 'Current stage:'} ${stage}`
+      session.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: `${summary}\n${stageInstruction(stage)}` }],
+        source: { kind: 'stage-switch', form: 'notice', summary },
+      }), { surfaceOp: 'append' })
+    }
+
+    try {
+      appendRecord(STAGE_FIRST, false)
+      expect(read().history[0]?.activeMs).toBe(0)
+      expect(read().activeTurn).toBeUndefined()
+
+      // Five active seconds, then ten idle seconds before the next turn: the
+      // idle gap must not reach the entry's active time.
+      clock.mockReturnValue(2_000)
+      session.append('turn/start', { turn: 1 })
+      clock.mockReturnValue(7_000)
+      session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+      expect(read().history[0]?.activeMs).toBe(5_000)
+      expect(read().activeTurn).toBeUndefined()
+
+      clock.mockReturnValue(17_000)
+      session.append('turn/start', { turn: 2 })
+      clock.mockReturnValue(20_000)
+      session.append('step/start', { turn: 2, step: 1 })
+      const open = read()
+      expect(open.history[0]?.activeMs).toBe(5_000)
+      // `through` follows committed events; `since` is the turn start.
+      expect(open.activeTurn).toEqual({ since: 17_000, through: 20_000 })
+
+      clock.mockReturnValue(21_000)
+      session.append('turn/end', { turn: 2, reason: { kind: 'aborted', reason: { kind: 'user' } } })
+      expect(read().history[0]?.activeMs).toBe(9_000)
+      expect(read().activeTurn).toBeUndefined()
+
+      // A switch that lands mid-turn splits the open span at the record: the
+      // running visit keeps its share, and the rest belongs to the new one.
+      clock.mockReturnValue(25_000)
+      session.append('turn/start', { turn: 3 })
+      clock.mockReturnValue(30_000)
+      appendRecord(STAGE_SECOND, true)
+      const split = read()
+      expect(split.history.map(entry => entry.activeMs)).toEqual([14_000, 0])
+      expect(split.activeTurn).toEqual({ since: 30_000, through: 30_000 })
+
+      clock.mockReturnValue(33_000)
+      session.append('turn/end', { turn: 3, reason: { kind: 'completed' } })
+      expect(read().history.map(entry => entry.activeMs)).toEqual([14_000, 3_000])
+    } finally {
+      clock.mockRestore()
+    }
   })
 })

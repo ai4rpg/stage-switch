@@ -9,9 +9,9 @@
 | 包 | 目录 | 是什么 |
 |---|---|---|
 | [`@ai4rpg/dsh-stage-switch`](stage-switch/README.zh.md) | `stage-switch/` | 阶段协作插件：按 agent 记录到日志的阶段状态、带用户评审切换的 `goto_stage` 工具、交接文档，以及 `/stage` 命令。 |
-| [`@ai4rpg/dsh-ui-sidebar-stage`](ui-sidebar-stage/README.zh.md) | `ui-sidebar-stage/` | Web 客户端右侧栏的**阶段标签页**：Atlas 式的当前阶段 hero、阶段旅程、每阶段计数与命令面板（配置了显示别名的阶段显示别名），另有实时标签页标题与输入框上方的阶段胶囊。会话有阶段记录后优先读 Host stage projection 的 wire view，否则回退到会话持久阶段记录的客户端折叠。 |
+| [`@ai4rpg/dsh-ui-sidebar-stage`](ui-sidebar-stage/README.zh.md) | `ui-sidebar-stage/` | Web 客户端右侧栏的**阶段标签页**：Atlas 式的当前阶段 hero、阶段旅程、每阶段计数与命令面板，另有实时标签页标题与输入框上方的阶段胶囊。优先读取 stage-switch 的阶段视图，读不到时从会话日志还原。 |
 
-两个包分开发布，是因为它们挂载在 harness 的不同层——插件挂载在预设作用域行，标签页挂载在宿主层行——但共享同一条历史与同一个锁文件。每个包有自己的 README（安装、配置、部署）与 npm 身份；插件的决策记录在 [`stage-switch/docs/DESIGN.zh.md`](stage-switch/docs/DESIGN.zh.md)。
+两个包分开发布，是因为它们挂载在 harness 的不同位置——插件按预设挂载，标签页在客户端外壳——但共享同一条历史与同一个锁文件。每个包有自己的 README（安装、配置、部署）与 npm 身份；插件的决策记录在 [`stage-switch/docs/DESIGN.zh.md`](stage-switch/docs/DESIGN.zh.md)。
 
 ## 开发
 

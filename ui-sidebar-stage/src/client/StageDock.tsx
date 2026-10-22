@@ -14,7 +14,7 @@ import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots
 // Type-only: pulls the conversation input-dock slot into this package's slot catalog.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { useStageWire } from './wire.ts'
-import { formatDuration, stageAccent } from './format.ts'
+import { activeDuration, formatDuration, stageAccent } from './format.ts'
 import { stageLabel } from './present.ts'
 
 /** Props supplied to the composer-dock entry. */
@@ -46,16 +46,24 @@ export function StageDock({
   const mounted = wire !== undefined
 
   useEffect(() => {
-    if (!mounted) return
+    if (!mounted || !running) return
+    setNow(Date.now())
     const timer = setInterval(() => { setNow(Date.now()) }, 1_000)
     return () => { clearInterval(timer) }
-  }, [mounted])
+  }, [mounted, running])
 
   if (wire === undefined) return null
   const catalogEntry = wire.stages.find(candidate => candidate.name === wire.stage)
   const label = catalogEntry === undefined ? wire.stage : stageLabel(catalogEntry)
   const entry = wire.history.at(-1)
-  const elapsed = entry?.time === undefined ? undefined : formatDuration(Math.max(0, now - entry.time))
+  const active = activeDuration(
+    { activeMs: entry?.activeMs, active: wire.activeTurn },
+    running,
+    now,
+  )
+  const elapsed = active !== undefined
+    ? formatDuration(active)
+    : entry?.time === undefined ? undefined : formatDuration(Math.max(0, now - entry.time))
   return (
     <div className="ui-stage-dock">
       <button

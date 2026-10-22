@@ -33,6 +33,53 @@ export function formatDuration(milliseconds: number): string {
 }
 
 /**
+ * The open turn's active window within the current stage visit.
+ *
+ * The structural copy of the Host wire view's `StageActiveTurn` (`wire.ts`
+ * re-exports the original type). Kept structural on purpose: this module stays
+ * free of Host types, so it can be exercised and reused without the wire.
+ */
+export interface StageActiveWindow {
+  /** Start of the open turn's share of the visit. */
+  readonly since: number
+  /** Newest committed event time folded into this source cut. */
+  readonly through: number
+}
+
+/** The timing fields of one stage visit. */
+export interface StageTiming {
+  /**
+   * Active-turn milliseconds accumulated within the visit (closed turns).
+   * Absent when the source predates active-turn timing; callers then fall back
+   * to the wall-clock stage span.
+   */
+  readonly activeMs?: number
+  /** The open turn's window, when this is the live visit and a turn is open. */
+  readonly active?: StageActiveWindow
+}
+
+/**
+ * Read one visit's active time at a given instant.
+ *
+ * The clock advances only while the session is running; when it is idle the
+ * open window freezes at its newest folded event (`through`), so a stop pauses
+ * the display instead of counting idle time. A source without `activeMs` (an
+ * older host) has no active timing and returns undefined.
+ * @param timing - the visit's timing fields.
+ * @param running - whether the session is running.
+ * @param now - current Unix epoch milliseconds.
+ * @returns active milliseconds, or undefined when the source has no timing.
+ */
+export function activeDuration(timing: StageTiming, running: boolean, now: number): number | undefined {
+  const settled = timing.activeMs
+  if (settled === undefined) return undefined
+  const active = timing.active
+  if (active === undefined) return settled
+  const end = running ? now : active.through
+  return settled + Math.max(0, end - active.since)
+}
+
+/**
  * Format a record's wall-clock time in the browser's locale.
  * @param epochMs - Unix epoch milliseconds.
  * @returns the local hour and minute.

@@ -136,6 +136,30 @@ export interface StageHistoryEntry {
   readonly tokens: number
   /** Failed `tool/result` events since this record. */
   readonly errors: number
+  /**
+   * Active-turn milliseconds accumulated within this visit: the sum of the
+   * closed turn spans after the record. Idle time between turns is excluded,
+   * so a client clock reading this value stops while the session is idle.
+   * Absent on hosts (and wire values) that predate active-turn timing; a
+   * client must then fall back to `time`-based wall-clock durations.
+   */
+  readonly activeMs?: number
+}
+
+/**
+ * The open turn's activity window within the current stage visit.
+ *
+ * `since` is the later of the turn's `turn/start` time and the current record's
+ * time (a switch can land mid-turn), so a client adds only the share that
+ * belongs to this visit. `through` is the newest committed event folded into
+ * this wire cut; a client freezes there when the session is not running, which
+ * stops the displayed clock before the durable `turn/end` lands.
+ */
+export interface StageActiveTurn {
+  /** Start of the open turn's share of the current visit. */
+  readonly since: number
+  /** Newest committed event time folded into this wire cut. */
+  readonly through: number
 }
 
 /**
@@ -157,6 +181,8 @@ export interface StageWireView {
   readonly history: readonly StageHistoryEntry[]
   /** Whether the oldest history entries were dropped to bound the projection. */
   readonly historyTruncated: boolean
+  /** The open turn's activity window, when the log holds an unterminated turn. */
+  readonly activeTurn?: StageActiveTurn
 }
 
 /** Deployment-owned stage-switch configuration. */
@@ -390,6 +416,7 @@ const stageHistoryEntrySchema = z.object({
   tools: z.number().int().nonnegative(),
   tokens: z.number().int().nonnegative(),
   errors: z.number().int().nonnegative(),
+  activeMs: z.number().int().nonnegative().optional(),
 }).strict()
 
 /** Per-event counter contribution for the current stage entry. */
@@ -438,11 +465,56 @@ function withStageMetrics(entry: StageHistoryEntry, delta: StageMetricDelta): St
   }
 }
 
+/** Add one settled active-turn span to a stage entry. */
+function withActiveMs(entry: StageHistoryEntry, milliseconds: number): StageHistoryEntry {
+  return { ...entry, activeMs: (entry.activeMs ?? 0) + Math.max(0, milliseconds) }
+}
+
+/**
+ * Settle a closed active-turn span into the newest visit.
+ *
+ * @param history The visit history.
+ * @param milliseconds The span's share for the newest visit.
+ * @returns The same array when no visit is recorded yet (a fresh or subagent
+ *   session), otherwise a new array with the newest entry extended.
+ */
+function settleLastEntry(
+  history: StageHistoryEntry[],
+  milliseconds: number,
+): StageHistoryEntry[] {
+  const current = history.at(-1)
+  if (current === undefined) return history
+  return [...history.slice(0, -1), withActiveMs(current, milliseconds)]
+}
+
+/**
+ * Whether a recorded visit saw no use at all: no messages, tools, tokens,
+ * errors, or settled turn time. A visit can still be current with an open
+ * turn; callers combine this with the projection's open-turn flag.
+ *
+ * `activeMs` is deliberately compared against `0`, not tested for presence: an
+ * entry without the field predates active-turn timing, so the plugin cannot
+ * prove the visit was empty and treats it as used. Guessing there would
+ * shadow a prompt the visit may well have used.
+ *
+ * @param entry The visit to test.
+ * @returns true when nothing happened during the visit.
+ */
+function isUnusedStageEntry(entry: StageHistoryEntry): boolean {
+  return entry.activeMs === 0
+    && entry.messages === 0
+    && entry.tools === 0
+    && entry.tokens === 0
+    && entry.errors === 0
+}
+
 /** Plain-JSON checkpoint schema for the `stage` projection unit. */
 const stageProjectionStateSchema = z.object({
   stage: z.string().nullable(),
   stageAtLastHeader: z.string().nullable(),
   openTurn: z.boolean(),
+  activeSince: z.number().int().nonnegative().nullable(),
+  activeThrough: z.number().int().nonnegative().nullable(),
   hasStagePrompt: z.boolean(),
   headSeq: z.number().int().nonnegative().nullable(),
   headIsSystem: z.boolean(),
@@ -460,6 +532,10 @@ const stageWireViewSchema: z.ZodType<StageWireView> = z.object({
   }).strict()),
   history: z.array(stageHistoryEntrySchema),
   historyTruncated: z.boolean(),
+  activeTurn: z.object({
+    since: z.number().int().nonnegative(),
+    through: z.number().int().nonnegative(),
+  }).strict().optional(),
 }).strict()
 
 /** Bound on the client-visible stage journey; older entries set the truncated flag. */
@@ -516,12 +592,14 @@ function stageProjectionDefinition(
   let lastView: StageWireView | undefined
   return {
     key: 'stage',
-    stateVersion: 2,
+    stateVersion: 3,
     stateSchema: stageProjectionStateSchema,
     init: () => ({
       stage: null,
       stageAtLastHeader: null,
       openTurn: false,
+      activeSince: null,
+      activeThrough: null,
       hasStagePrompt: false,
       headSeq: null,
       headIsSystem: false,
@@ -537,7 +615,34 @@ function stageProjectionDefinition(
       const head = surfaceHeadAfter(state, event)
       let history = state.history
       let historyTruncated = state.historyTruncated
+      let activeSince = state.activeSince
+      let activeThrough = state.activeThrough
+
+      // Track the open turn's wall-clock window. `activeThrough` moves on every
+      // committed event so an idle client freezes at the newest known cut
+      // instead of the turn start.
+      if (event.type === 'turn/start') {
+        activeSince = event.time
+        activeThrough = event.time
+      } else if (activeSince !== null) {
+        activeThrough = event.time
+      }
+
+      if (event.type === 'turn/end' && activeSince !== null) {
+        history = settleLastEntry(history, event.time - activeSince)
+        activeSince = null
+        activeThrough = null
+      }
+
       if (record !== undefined) {
+        if (activeSince !== null) {
+          // A switch can land mid-turn. Settle the running visit's share at the
+          // record and start the new visit at that instant; the rest of the
+          // open turn belongs to the new stage.
+          history = settleLastEntry(history, event.time - activeSince)
+          activeSince = Math.max(activeSince, event.time)
+          activeThrough = event.time
+        }
         history = [...history, {
           stage: record.stage,
           seq: event.seq,
@@ -547,6 +652,7 @@ function stageProjectionDefinition(
           tools: 0,
           tokens: 0,
           errors: 0,
+          activeMs: 0,
         }]
         if (history.length > STAGE_HISTORY_LIMIT) {
           history = history.slice(history.length - STAGE_HISTORY_LIMIT)
@@ -562,25 +668,39 @@ function stageProjectionDefinition(
       if (stage === state.stage && stageAtLastHeader === state.stageAtLastHeader
         && openTurn === state.openTurn && hasStagePrompt === state.hasStagePrompt
         && head.headSeq === state.headSeq && head.headIsSystem === state.headIsSystem
+        && activeSince === state.activeSince && activeThrough === state.activeThrough
         && history === state.history && historyTruncated === state.historyTruncated) return state
-      return { stage, stageAtLastHeader, openTurn, hasStagePrompt, ...head, history, historyTruncated }
+      return {
+        stage, stageAtLastHeader, openTurn, activeSince, activeThrough,
+        hasStagePrompt, ...head, history, historyTruncated,
+      }
     },
     wire: {
       viewSchema: stageWireViewSchema,
       view: (state) => {
         const stage = state.stage ?? initial
+        const activeTurn = state.activeSince !== null && state.activeThrough !== null
+          ? { since: state.activeSince, through: state.activeThrough }
+          : undefined
         // Reuse the view across internal-only state changes (the open-turn
         // flag, header watermark, and surface head) so the registry's
         // Object.is check does not publish a value the client already has.
+        // The timing fields are the exception: `through` advances on every
+        // committed event while a turn is open, so an active turn republishes
+        // once per event. That is the price of the client-side freeze at the
+        // newest known cut; the publishes stop as soon as the turn ends.
         if (lastView !== undefined
           && lastView.stage === stage
           && lastView.history === state.history
-          && lastView.historyTruncated === state.historyTruncated) return lastView
+          && lastView.historyTruncated === state.historyTruncated
+          && lastView.activeTurn?.since === activeTurn?.since
+          && lastView.activeTurn?.through === activeTurn?.through) return lastView
         lastView = {
           stage,
           stages: catalog,
           history: state.history,
           historyTruncated: state.historyTruncated,
+          ...activeTurn === undefined ? {} : { activeTurn },
         }
         return lastView
       },
@@ -643,6 +763,14 @@ interface StageProjectionState {
   stageAtLastHeader: string | null
   /** Whether the log holds an opened turn without its closing `turn/end`. */
   openTurn: boolean
+  /**
+   * Start of the open turn's share of the current entry: the later of the
+   * turn's `turn/start` and the current record's `time`, because a switch can
+   * land mid-turn. `null` while no turn is open.
+   */
+  activeSince: number | null
+  /** Newest committed event time folded while the turn is open, or `null`. */
+  activeThrough: number | null
   /** Whether the log already carries a stage prompt message (any stage entry). */
   hasStagePrompt: boolean
   /** Seq of surface node 0, or `null` while the surface is empty. */
@@ -1050,9 +1178,77 @@ export class StageController extends Service {
     // written: an event type outside the stock harness's known-event catalog
     // would make a reader without this plugin refuse the whole log.
     this.pendingTransitions.delete(session)
-    const narrate = this.shouldNarrate(session, stage)
-    session.append('user/message', this.stagePromptMessage(stage, narrate), { surfaceOp: 'append' })
+    this.appendStagePrompt(session, stage, this.shouldNarrate(session, stage))
     return 'committed'
+  }
+
+  /**
+   * Append the stage prompt that records one stage entry.
+   *
+   * A stage visit that never saw a message, tool call, token, or active turn
+   * is a transient detour: the user selected it and immediately selected
+   * another stage. Its prompt is still appended (the append-only log keeps
+   * the audit record), but the replacement branch shadows the trailing run
+   * of transient prompts with the new prompt instead of appending beside
+   * them. The model therefore never sees an abandoned instruction, while the
+   * projection's history still records each visit for the sidebar to fold out.
+   * The replacement is limited to light entries (`switched` is false; a full
+   * handoff notice is never rewritten) whose prompts are still the surface
+   * tail, so the new prompt stays at the conversation tail.
+   *
+   * @param session The session receiving the entry.
+   * @param stage The entered stage.
+   * @param narrate Prepend the user-switch notice when the last header described another stage.
+   */
+  private appendStagePrompt(session: Session, stage: string, narrate: boolean): void {
+    const transient = this.transientPromptRange(session)
+    const message = this.stagePromptMessage(stage, narrate)
+    const first = transient[0]
+    const last = transient.at(-1)
+    if (first === undefined || last === undefined) {
+      session.append('user/message', message, { surfaceOp: 'append' })
+      return
+    }
+    session.append('user/message', message, {
+      surfaceOp: { op: 'replace', startSeq: first, endSeq: last },
+      sourceEventSeqs: transient,
+    })
+  }
+
+  /**
+   * The trailing surface prompt range of transient stage visits, or an empty
+   * array when the current visit was used or cannot be safely shadowed.
+   *
+   * "Unused" is deliberately strict: no counted activity, no settled active
+   * turn time, and no open turn. The walk stops at the first used visit or a
+   * full-transition `Stage switched to` record. The collected prompts must be
+   * exactly the surface tail, in order; if another plugin's system/developer
+   * notice sits between them (or a prompt was already shadowed), the method
+   * falls back to the last prompt when it is the tail node, and otherwise
+   * returns an empty range so the caller appends normally rather than moving
+   * the stage instruction earlier or dropping unrelated surface content.
+   *
+   * @param session The session to inspect.
+   * @returns The prompts' surface seqs, oldest first.
+   */
+  private transientPromptRange(session: Session): SessionSeq[] {
+    const state = this.projectionOf(session)
+    if (state.openTurn) return []
+    const seqs: SessionSeq[] = []
+    for (let index = state.history.length - 1; index >= 0; index -= 1) {
+      const entry = state.history[index]
+      if (entry === undefined || entry.switched || !isUnusedStageEntry(entry)) break
+      seqs.push(entry.seq as SessionSeq)
+    }
+    if (seqs.length === 0) return []
+    seqs.reverse()
+    const nodes = session.surface.nodes
+    const tail = nodes.slice(-seqs.length)
+    if (tail.length === seqs.length && tail.every((seq, index) => seq === seqs[index])) {
+      return seqs
+    }
+    const last = seqs.at(-1)
+    return last !== undefined && nodes.at(-1) === last ? [last] : []
   }
 
   /** Whether a user-driven switch should narrate because the last header described the other stage. */
@@ -1148,7 +1344,7 @@ export class StageController extends Service {
       this.replaceWithHandoffNotice(session, pending.stage, pending.handoffPath)
     } else {
       const narrate = pending.narrate && this.shouldNarrate(session, pending.stage)
-      session.append('user/message', this.stagePromptMessage(pending.stage, narrate), { surfaceOp: 'append' })
+      this.appendStagePrompt(session, pending.stage, narrate)
     }
     // Delete only after the message append succeeds so a later accepted
     // in-turn pre-step can retry a failed durable write.

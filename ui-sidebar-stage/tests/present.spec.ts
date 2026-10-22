@@ -21,10 +21,11 @@ function wire(): StageWireView {
     stage: STAGE_NAMES.second,
     stages: CATALOG,
     history: [
-      { stage: STAGE_NAMES.first, seq: 1, time: 10, switched: false, messages: 4, tools: 2, tokens: 80, errors: 0 },
-      { stage: STAGE_NAMES.second, seq: 2, time: 20, switched: true, messages: 3, tools: 1, tokens: 120, errors: 1 },
+      { stage: STAGE_NAMES.first, seq: 1, time: 10, switched: false, messages: 4, tools: 2, tokens: 80, errors: 0, activeMs: 4_000 },
+      { stage: STAGE_NAMES.second, seq: 2, time: 20, switched: true, messages: 3, tools: 1, tokens: 120, errors: 1, activeMs: 60_000 },
     ],
     historyTruncated: true,
+    activeTurn: { since: 25, through: 30 },
   }
 }
 
@@ -57,17 +58,45 @@ describe('presentStages', () => {
       tools: 2,
       tokens: 80,
       live: false,
+      activeMs: 4_000,
     })
+    expect(view.segments[0]?.active).toBeUndefined()
     expect(view.segments[1]).toMatchObject({
       stage: STAGE_NAMES.second,
       label: STAGE_ALIASES.second,
       instruction: `Do ${STAGE_NAMES.second}.`,
       errors: 1,
       live: true,
+      activeMs: 60_000,
+      active: { since: 25, through: 30 },
     })
     expect(view.future.map(entry => entry.name)).toEqual([STAGE_NAMES.third])
     expect(view.future[0]?.alias).toBe(STAGE_ALIASES.third)
     expect(view.historyTruncated).toBe(true)
+  })
+
+  it('keeps every recorded visit, including an unused detour', () => {
+    const view = presentStages({
+      stage: STAGE_NAMES.first,
+      stages: CATALOG,
+      history: [
+        { stage: STAGE_NAMES.first, seq: 1, time: 10, switched: false, messages: 2, tools: 1, tokens: 30, errors: 0, activeMs: 4_000 },
+        { stage: STAGE_NAMES.second, seq: 2, time: 20, switched: false, messages: 0, tools: 0, tokens: 0, errors: 0, activeMs: 0 },
+        { stage: STAGE_NAMES.first, seq: 3, time: 30, switched: false, messages: 1, tools: 0, tokens: 10, errors: 0, activeMs: 2_000 },
+      ],
+      historyTruncated: false,
+    }, { current: undefined, records: [] })
+
+    // A zero-use visit is still a recorded visit: it must not vanish from the
+    // journey while remaining counted as visited (which would also remove it
+    // from the future list). The Host may shadow its prompt, but the tab's
+    // journey stays complete and every stage remains reachable.
+    expect(view.segments.map(segment => segment.stage)).toEqual([
+      STAGE_NAMES.first, STAGE_NAMES.second, STAGE_NAMES.first,
+    ])
+    expect(view.segments[1]?.live).toBe(false)
+    expect(view.segments[2]?.live).toBe(true)
+    expect(view.future.map(entry => entry.name)).toEqual([STAGE_NAMES.third])
   })
 
   it('keeps a current initial stage before the first record, with no timer', () => {

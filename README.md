@@ -9,9 +9,9 @@ This repository is one npm workspace publishing two packages:
 | Package | Directory | What it is |
 |---|---|---|
 | [`@ai4rpg/dsh-stage-switch`](stage-switch/README.md) | `stage-switch/` | The stage-collaboration plugin: logged per-agent stage state, the `goto_stage` tool with its user-reviewed transition, the handoff document, and the `/stage` command. |
-| [`@ai4rpg/dsh-ui-sidebar-stage`](ui-sidebar-stage/README.md) | `ui-sidebar-stage/` | The right-Sidebar **stage tab** of the Web client: an Atlas-style current-stage hero, stage journey, per-stage counters, and a command palette (display aliases shown where configured), plus a live tab title and a composer stage pill. It prefers the Host stage projection's wire view once the session has a stage record, and otherwise folds the session's durable stage records client-side. |
+| [`@ai4rpg/dsh-ui-sidebar-stage`](ui-sidebar-stage/README.md) | `ui-sidebar-stage/` | The right-Sidebar **stage tab** of the Web client: an Atlas-style current-stage hero, the stage journey, per-stage counters, and a command palette, plus a live tab title and a composer stage pill. It uses stage-switch's stage view when available and otherwise works from the session log. |
 
-They publish separately because they mount on different planes of the harness — the plugin on a preset-scoped row, the tab on a host-plane row — but share one history and one lockfile. Each package keeps its own README (installation, configuration, deployment) and npm identity; the plugin's decision record is [`stage-switch/docs/DESIGN.md`](stage-switch/docs/DESIGN.md).
+They publish separately because they mount in different parts of the harness — the plugin per preset, the tab in the client shell — but share one history and one lockfile. Each package keeps its own README (installation, configuration, deployment) and npm identity; the plugin's decision record is [`stage-switch/docs/DESIGN.md`](stage-switch/docs/DESIGN.md).
 
 ## Development
 

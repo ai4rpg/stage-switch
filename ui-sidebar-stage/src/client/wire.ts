@@ -2,21 +2,21 @@
  * Client view of the optional Host `stage` projection, plus the display slice
  * of the optional `contextPressure` projection.
  *
- * The wire value is the Host's authoritative catalog/history/metrics: it is
- * present when the runtime mounted stage-switch (and the host release renders
- * the wire view); {@link useStageWire} additionally requires the session's own
- * durable stage record, because the projection key is runtime-global. The
- * type is imported type-only
- * from the workspace source, the same pinning pattern the fold contract uses;
- * the type-only import is erased from the browser bundle, so the tab still
- * runs without stage-switch. The `contextPressure` key has no local type
- * augmentation: token-meter owns that declaration, and the tab only consumes
- * its optional display fields when the capability is present.
+ * The wire value is the Host's authoritative catalog/history/metrics and
+ * active-turn timing. It is present when the runtime mounted stage-switch (and
+ * the host release renders the wire view); {@link useStageWire} additionally
+ * requires the session's own durable stage record, because the projection key
+ * is runtime-global. The type is imported type-only from the workspace source,
+ * the same pinning pattern the fold contract uses; the type-only import is
+ * erased from the browser bundle, so the tab still runs without stage-switch.
+ * The `contextPressure` key has no local type augmentation: token-meter owns
+ * that declaration, and the tab only consumes its optional display fields when
+ * the capability is present.
  */
 import type { StageWireView } from '@ai4rpg/dsh-stage-switch/src/index.ts'
 import type { UseProjection } from '@deepseek-ai/dsh-api-session-controller/client'
 
-export type { StageHistoryEntry, StageWireView } from '@ai4rpg/dsh-stage-switch/src/index.ts'
+export type { StageActiveTurn, StageHistoryEntry, StageWireView } from '@ai4rpg/dsh-stage-switch/src/index.ts'
 
 /** The display fields of the token-meter context-pressure projection. */
 export interface ContextPressureView {

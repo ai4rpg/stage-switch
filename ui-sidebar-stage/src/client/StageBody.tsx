@@ -18,7 +18,7 @@ import type { StageSwitchOutcome } from './switch.ts'
 import type { StageCatalogEntry, StageSegment } from './present.ts'
 import { presentStages, stageLabel } from './present.ts'
 import { useContextPressure, useStageWire } from './wire.ts'
-import { contextPercent, formatClock, formatDuration, formatTokens, isMacPlatform, stageAccent } from './format.ts'
+import { activeDuration, contextPercent, formatClock, formatDuration, formatTokens, isMacPlatform, stageAccent } from './format.ts'
 import { StagePalette } from './StagePalette.tsx'
 
 /** Props supplied to the stage tab body. */
@@ -68,35 +68,55 @@ function CompassGlyph() {
   )
 }
 
-/** The duration of one visit, ended by the next visit or the live clock. */
-function durationOf(segments: readonly StageSegment[], segment: StageSegment, now: number): number | undefined {
+/**
+ * The duration of one visit: active turn time when the source carries it, else
+ * the wall-clock span to the next visit.
+ * @param segments - the recorded visits, in log order.
+ * @param index - the visit's position in {@link segments}.
+ * @param running - whether the session is running (the live visit's clock).
+ * @param now - current Unix epoch milliseconds.
+ * @returns elapsed milliseconds, or undefined before the visit started.
+ */
+function durationOf(
+  segments: readonly StageSegment[],
+  index: number,
+  running: boolean,
+  now: number,
+): number | undefined {
+  const segment = segments[index]
+  if (segment === undefined) return undefined
+  const active = activeDuration(segment, running, now)
+  if (active !== undefined) return active
   if (segment.time === undefined) return undefined
-  const index = segments.indexOf(segment)
-  const next = index >= 0 ? segments[index + 1] : undefined
+  const next = segments[index + 1]
   return next?.time === undefined ? Math.max(0, now - segment.time) : Math.max(0, next.time - segment.time)
 }
 
 /** One journey row: a switchable visit or the inert current one. */
 function JourneyRow({
   segment,
+  index,
   catalog,
   segments,
   now,
+  running,
   pending,
   onSwitch,
   t,
 }: {
   readonly segment: StageSegment
+  readonly index: number
   readonly catalog: readonly StageCatalogEntry[]
   readonly segments: readonly StageSegment[]
   readonly now: number
+  readonly running: boolean
   readonly pending: boolean
   readonly onSwitch: (stage: string) => void
   readonly t: StageBodyProps['t']
 }) {
   const live = segment.live
   const accent = stageAccent(segment.stage, catalog)
-  const duration = durationOf(segments, segment, now)
+  const duration = durationOf(segments, index, running, now)
   const time = segment.time === undefined ? t('notStarted') : formatClock(segment.time)
   const metrics = segment.time === undefined
     ? t('notStarted')
@@ -230,9 +250,11 @@ export function StageBody({
   const mac = useMemo(() => isMacPlatform(), [])
 
   useEffect(() => {
+    if (!running) return
+    setNow(Date.now())
     const timer = setInterval(() => { setNow(Date.now()) }, 1_000)
     return () => { clearInterval(timer) }
-  }, [])
+  }, [running])
 
   // A successful request parks until the durable record lands; once the
   // current stage becomes the requested one, the hero's "requested" note is
@@ -245,7 +267,10 @@ export function StageBody({
 
   const current = presentation.current
   const currentEntry = presentation.segments.find(segment => segment.live)
-  const elapsed = currentEntry?.time === undefined ? undefined : Math.max(0, now - currentEntry.time)
+  const elapsed = currentEntry === undefined
+    ? undefined
+    : activeDuration(currentEntry, running, now)
+      ?? (currentEntry.time === undefined ? undefined : Math.max(0, now - currentEntry.time))
   const currentIndex = presentation.catalog.findIndex(entry => entry.name === current)
   const ringIndex = currentIndex >= 0
     ? currentIndex + 1
@@ -308,6 +333,8 @@ export function StageBody({
           current={current}
           catalog={presentation.catalog}
           segments={presentation.segments}
+          running={running}
+          now={now}
           pending={pendingStage !== undefined}
           onClose={closePalette}
           onPick={requestSwitch}
@@ -388,7 +415,7 @@ export function StageBody({
             ? <span className="ui-stage-in-stage">{t('notStarted')}</span>
             : (
               <span className="ui-stage-in-stage">
-                <b>{formatDuration(elapsed)}</b> {t('inStage')}
+                <b>{formatDuration(elapsed)}</b> {t('activeInStage')}
               </span>
             )}
           {requestedStage !== undefined && requestedStage !== current && (
@@ -446,33 +473,37 @@ export function StageBody({
           {presentation.historyTruncated ? t('historyTruncated') : t('historyPartial')}
         </p>
       )}
-      <ol className="ui-stage-journey" data-stage-history="">
-        {presentation.segments.length + presentation.future.length > 1 && (
-          <span className="ui-stage-spine" aria-hidden="true" />
-        )}
-        {presentation.segments.map(segment => (
-          <JourneyRow
-            key={`${segment.stage}:${String(segment.seq)}`}
-            segment={segment}
-            catalog={presentation.catalog}
-            segments={presentation.segments}
-            now={now}
-            pending={pendingStage !== undefined}
-            onSwitch={requestSwitch}
-            t={t}
-          />
-        ))}
-        {presentation.future.map(entry => (
-          <FutureRow
-            key={`future:${entry.name}`}
-            entry={entry}
-            catalog={presentation.catalog}
-            pending={pendingStage !== undefined}
-            onSwitch={requestSwitch}
-            t={t}
-          />
-        ))}
-      </ol>
+      <div className="ui-stage-journey-scroll" data-stage-journey-scroll="">
+        <ol className="ui-stage-journey" data-stage-history="">
+          {presentation.segments.length + presentation.future.length > 1 && (
+            <span className="ui-stage-spine" aria-hidden="true" />
+          )}
+          {presentation.segments.map((segment, index) => (
+            <JourneyRow
+              key={`${segment.stage}:${String(segment.seq)}`}
+              segment={segment}
+              index={index}
+              catalog={presentation.catalog}
+              segments={presentation.segments}
+              now={now}
+              running={running}
+              pending={pendingStage !== undefined}
+              onSwitch={requestSwitch}
+              t={t}
+            />
+          ))}
+          {presentation.future.map(entry => (
+            <FutureRow
+              key={`future:${entry.name}`}
+              entry={entry}
+              catalog={presentation.catalog}
+              pending={pendingStage !== undefined}
+              onSwitch={requestSwitch}
+              t={t}
+            />
+          ))}
+        </ol>
+      </div>
 
       {failure !== undefined && !failure.ok && (
         <p className="ui-stage-failure" data-stage-failure="" role="alert">
@@ -504,6 +535,8 @@ export function StageBody({
         current={current}
         catalog={presentation.catalog}
         segments={presentation.segments}
+        running={running}
+        now={now}
         pending={pendingStage !== undefined}
         onClose={closePalette}
         onPick={requestSwitch}
