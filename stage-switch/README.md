@@ -74,7 +74,7 @@ The next accepted in-turn pre-step appends the target stage's prompt message —
 
 A configured `minHandoffTokens` requires `@deepseek-ai/dsh-token-meter` in the composition; a `goto_stage` call fails loud when it is missing. The service also requires `@deepseek-ai/dsh-session-projection` to publish stage state to the sidebar — the harness's base bundle mounts it, so standard compositions already provide it; activation fails loud without it.
 
-The package declares `engines.dsh` (`>=0.2.0-rc.2 <0.3.0-0`) as its DSH compatibility gate. DSH's app-boot and plugin-manager prefer that range over the dsh `peerDependencies`; the peers remain in the manifest because the Loader's profile resolution uses their names to route this plugin's host-package imports to the installation copy. The dsh peer ranges accept both the 0.2.0 line and the 0.2.1 prerelease line, so a host on either line passes npm's peer check. The engine range is the compatibility source, not the peer ranges; a dsh installation outside it is unsupported.
+The package requires Node.js `>=24.9.0` and declares `engines.dsh` (`>=0.2.2-rc.3 <0.3.0-0`) as its DSH compatibility gate. DSH prefers that range over the `peerDependencies`; the peers (`^0.2.2-rc.3`) remain in the manifest because the Loader's profile resolution uses their names to route host-package imports to the installation copy. This release uses the rc.2+ projection-handle API; its Zod pin matches rc.3's `4.6.6` because projection schema types cross the package boundary. A dsh installation outside the engine range is unsupported.
 
 ## Prompt copy
 

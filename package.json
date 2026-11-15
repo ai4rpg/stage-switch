@@ -10,5 +10,10 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm test --workspaces --if-present",
     "build": "npm run build --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-client-store": "^0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-ui-sidebar-right": "^0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.2.2-rc.3"
   }
 }

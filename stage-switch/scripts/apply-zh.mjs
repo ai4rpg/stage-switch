@@ -20,7 +20,7 @@
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -74,8 +74,9 @@ export function applyZh(root = join(here, '..')) {
   return merged
 }
 
-// CLI entry point: run when this file is the main module.
-// Match the same pattern as scripts/sync-prompts.mjs for consistency.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// CLI entry point: run when this file is the main module. Compare resolved
+// URLs so the check also holds on Windows, where `process.argv[1]` is a native
+// path (`C:\…`) and a hand-built `file://` URL never matches.
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   applyZh()
 }

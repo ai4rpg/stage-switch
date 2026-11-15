@@ -28,6 +28,10 @@ export function makeAgent(ctx: Context, id: string, cwd: string): Agent {
     id: SessionId(id),
     options: {},
     session,
+    model: {
+      current: () => ({ provider: 'test', model: 'test-model' }),
+      select: () => { throw new Error('model selection is not used by stage-switch composition tests') },
+    },
     inbox: {
       nextTurn: [],
       nextStep: [],

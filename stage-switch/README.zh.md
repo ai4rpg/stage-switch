@@ -74,7 +74,7 @@ Explore the problem space and present a plan.
 
 配置了 `minHandoffTokens` 时，组合中需要 `@deepseek-ai/dsh-token-meter`；缺失时 `goto_stage` 调用会大声失败。服务还需要 `@deepseek-ai/dsh-session-projection` 才能向侧栏发布阶段状态——harness 的 base bundle 已挂载它，因此标准组合天然具备；缺失时激活阶段即大声失败。
 
-本包声明 `engines.dsh`（`>=0.2.0-rc.2 <0.3.0-0`）作为 DSH 兼容门禁。DSH 的 app-boot 与 plugin-manager 优先使用该区间而不是 dsh `peerDependencies`；peers 仍保留在 manifest 中，因为 Loader 的 profile resolution 要用这些名字把本插件的宿主包 import 路由到安装副本。dsh peer 区间同时接受 0.2.0 线与 0.2.1 预发布线，因此任一条线上的宿主都能通过 npm 的 peer 检查。兼容性以 engine 区间为准，而不是 peer 区间；超出该区间的 dsh 安装不受支持。
+本包要求 Node.js `>=24.9.0`，并声明 `engines.dsh`（`>=0.2.2-rc.3 <0.3.0-0`）作为 DSH 兼容门禁。DSH 优先使用该区间而不是 `peerDependencies`；peers（`^0.2.2-rc.3`）仍保留在 manifest 中，因为 Loader 的 profile resolution 要用这些名字把宿主包 import 路由到安装副本。本版使用 rc.2+ 的投影 handle API；投影 schema 类型跨包传递，因此 Zod 精确匹配 rc.3 的 `4.6.6`。超出该 engine 区间的 dsh 安装不受支持。
 
 ## 提示词文案
 

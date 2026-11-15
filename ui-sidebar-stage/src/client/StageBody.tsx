@@ -283,7 +283,7 @@ export function StageBody({
     context?.contextWindow,
   )
   const visitedBefore = new Set(presentation.segments.slice(0, -1).map(segment => segment.stage))
-  const keycap = mac ? '⌘K' : 'Ctrl K'
+  const keycap = mac ? '⌘⇧K' : 'Ctrl Shift K'
 
   const closePalette = (): void => {
     setPaletteOpen(false)
@@ -306,7 +306,7 @@ export function StageBody({
 
   const onRootKeyDown = (event: ReactKeyboardEvent<HTMLElement>): void => {
     if (paletteOpen) return
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+    if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'k') {
       event.preventDefault()
       openPalette()
     }

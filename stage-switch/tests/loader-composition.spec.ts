@@ -40,6 +40,7 @@ import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import UserQuestionService, { type AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
 import { assertV4RowAdmission } from '@deepseek-ai/dsh-session-format-v3-to-v4'
 import StageController, { GOTO_STAGE, foldStage } from '../src/index.ts'
@@ -86,6 +87,7 @@ async function loadComposition(
     "- name: '@deepseek-ai/dsh-system-prompt'",
     "- name: '@deepseek-ai/dsh-token-meter'",
     "- name: '@deepseek-ai/dsh-tools'",
+    "- name: '@deepseek-ai/dsh-tool-executor-native'",
     "- name: '@deepseek-ai/dsh-agent'",
     "- name: '@deepseek-ai/dsh-user-questions'",
     "- name: '@deepseek-ai/dsh-commands'",
@@ -110,6 +112,7 @@ async function loadComposition(
     ['@deepseek-ai/dsh-system-prompt', SystemPrompt],
     ['@deepseek-ai/dsh-token-meter', TokenMeter],
     ['@deepseek-ai/dsh-tools', ToolRuntime],
+    ['@deepseek-ai/dsh-tool-executor-native', NativeExecutor],
     ['@deepseek-ai/dsh-agent', AgentRegistry],
     ['@deepseek-ai/dsh-user-questions', UserQuestionService],
     ['@deepseek-ai/dsh-commands', CommandRuntime],
@@ -124,6 +127,15 @@ async function loadComposition(
   } as unknown as NonNullable<typeof context.loader.internal>
   await context.loader.create({ name: 'cordis:include', config: { path: pathToFileURL(configPath).href } })
   await context.loader.await()
+  // Awaiting the tree alone also settles pending/failed rows: verify the
+  // actual activation graph instead of assuming a non-throw means ready.
+  for (const entry of context.loader.entries()) {
+    if (entry.disabled) continue
+    expect(entry.fiber, `Loader row ${entry.options.name}`).toBeDefined()
+    if (entry.fiber === undefined) throw new Error(`missing Loader fiber: ${entry.options.name}`)
+    await entry.fiber.await()
+    expect(entry.fiber.committed, `ready Loader row ${entry.options.name}`).toBeDefined()
+  }
 
   const agent = makeAgent(context, 'agent-1', '/workspace')
   // The command child (`ctx.inject(['commands'])`) settles during boot; poll
@@ -138,14 +150,19 @@ async function loadComposition(
 }
 
 let callCounter = 0
-function callStage(ctx: Context, name: string, agent: Agent, args: Record<string, unknown>) {
-  return ctx.tools.execute({
-    callId: ToolCallId(`loader-call-${++callCounter}`),
-    name,
-    arguments: args,
+async function callStage(ctx: Context, name: string, agent: Agent, args: Record<string, unknown>) {
+  const callId = ToolCallId(`loader-call-${++callCounter}`)
+  const batch = await ctx.tools.execute({
+    calls: [{ type: 'tool-call', id: callId, name, arguments: JSON.stringify(args) }],
     signal: new AbortController().signal,
     agent,
   })
+  expect(batch.results).toHaveLength(1)
+  expect(batch.results[0]?.callId).toBe(callId)
+  expect(batch.additionalContexts).toEqual([])
+  const entry = batch.results[0]
+  if (entry === undefined) throw new Error('expected one stage tool result')
+  return entry.result
 }
 
 describe('real Loader composition through cordis.yml', () => {
@@ -170,12 +187,10 @@ describe('real Loader composition through cordis.yml', () => {
     expect(stageNoticeSummaries(agent.session)).toEqual([`Current stage: ${STAGE_FIRST}`])
     expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_FIRST)
 
-    // The read path is the session-projection seam: the service's reads go
-    // through the registered `stage` unit (the harness deprecated the
-    // synchronous whole-log readers), so the composition pins that the unit
-    // is live and carries the folded state the service reads.
-    expect(ctx.sessionProjections.stateOf(agent.session, 'stage'))
-      .toMatchObject({ stage: STAGE_FIRST, hasStagePrompt: true })
+    // Read host state through its public owner, not the deprecated registry
+    // reader or a private handle. The repeated boundary above/below also pins
+    // the folded once-only stage-prompt flag.
+    expect(ctx.stage.current(agent.session)).toBe(STAGE_FIRST)
 
     // The wire view is the client-visible read model: the configured catalog
     // (with instructions) and the recorded journey, even before the browser
@@ -426,6 +441,7 @@ describe('real Loader composition through cordis.yml', () => {
     const { ctx, agent } = await loadComposition()
     await boundary(ctx, agent, 'pre-step')
     expect(stageNoticeSummaries(agent.session)).toHaveLength(1)
+    const retained = ctx.stage
 
     // The disposal leg of a loader HMR reload: dispose every running fiber of
     // the stage-switch plugin (the same unload cordis runs when the entry
@@ -446,6 +462,9 @@ describe('real Loader composition through cordis.yml', () => {
     expect(foldStage(agent.session.snapshotEvents())).toBe(STAGE_FIRST)
     // The projection registration was effect-scoped on the plugin's fiber:
     // disposal removes the key (capability absence, not a stale read path).
-    expect(ctx.sessionProjections.stateOf(agent.session, 'stage')).toBeUndefined()
+    expect(ctx.sessionProjections.snapshot(agent.session).values.stage).toBeUndefined()
+    expect(() => retained.current(agent.session)).toThrow('the stage service is disposed')
+    expect(() => retained.set(agent, STAGE_SECOND)).toThrow('the stage service is disposed')
+    expect(() => retained.registerEligibility(() => true)).toThrow('the stage service is disposed')
   })
 })

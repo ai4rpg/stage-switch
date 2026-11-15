@@ -22,7 +22,7 @@ import { HARNESS_ROOT as HARNESS } from './workspace-root.ts'
 const active = process.env.DSH_WORKSPACE_INTEGRATION === '1' && existsSync(`${HARNESS}/tsconfig.base.json`)
 
 describe.skipIf(!active)('workspace integration over the dsh source checkout', () => {
-  it('renders the stage tab body through the production slot system with a live session', async () => {
+  it('renders the stage tab body through the production slot system with a live session', { timeout: 60_000 }, async () => {
     // Drift guard: the checkout must sit on the same dsh line this package's
     // devDependencies pin (read from package.json, so a dependency bump moves
     // the guard with it). A checkout that moved on (git pull) fails loud

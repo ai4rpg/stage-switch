@@ -18,7 +18,7 @@
 
 import { readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 export const repoRoot = fileURLToPath(new URL('..', import.meta.url))
 
@@ -112,6 +112,9 @@ export const DEFAULT_STAGE_SWITCH_PROMPTS = ${json} as const satisfies StageSwit
   console.log('  ✓ src/prompts.defaults.ts regenerated from src/prompts.json')
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Compare URLs on both sides: `process.argv[1]` is a native path (`C:\…` on
+// Windows), so building `file://${process.argv[1]}` by hand never matches the
+// module URL there; the script would silently do nothing and exit 0.
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   writeDefaultsTs()
 }

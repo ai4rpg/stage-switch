@@ -140,6 +140,18 @@ export class MemoryFs extends FileSystem {
   async editText(): Promise<never> {
     throw new Error('editText is not used by stage-switch tests')
   }
+
+  async patchText(): Promise<never> {
+    throw new Error('patchText is not used by stage-switch tests')
+  }
+
+  async deleteFile(): Promise<never> {
+    throw new Error('deleteFile is not used by stage-switch tests')
+  }
+
+  async moveFile(): Promise<never> {
+    throw new Error('moveFile is not used by stage-switch tests')
+  }
 }
 
 /** Open a turn so a reviewed transition queues for the boundary flush. */
@@ -167,7 +179,7 @@ export async function boundary(
   const signal = new AbortController().signal
   const decision = await events.waterfall(
     'agent/pre-step',
-    { messages: [message], turn: 1, step: 1, signal },
+    { messages: [message], turn: 1, step: 1, signal, modelSelection: { provider: 'test', model: 'test-model' } },
     () => Promise.resolve({ kind: 'enter' as const, messages: [message] }),
   )
   if (decision.kind === 'enter') {

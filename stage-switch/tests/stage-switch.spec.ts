@@ -4,6 +4,7 @@ import { createAssistantMessage, createDeveloperMessage, createUserMessage, Tool
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import SystemPrompt, { renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { Session, SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
 import AgentRegistry, { agentEvents, type Agent } from '@deepseek-ai/dsh-agent'
 import { createScope } from '@deepseek-ai/dsh-scope'
@@ -59,7 +60,7 @@ class MemorySandboxPolicy extends Service {
 async function agentWithSession(
   ctx: Context,
   id = 'agent-1',
-  { owner, cwd, origin, delegationDepth }: { owner?: Agent; cwd?: string; origin?: 'subagent'; delegationDepth?: number } = {},
+  { cwd, origin, delegationDepth }: { cwd?: string; origin?: 'subagent'; delegationDepth?: number } = {},
 ): Promise<Agent & { session: Session }> {
   const base = Session.create(SessionId(id))
   const header = { ...base.header, ...cwd === undefined ? {} : { cwd } }
@@ -83,7 +84,7 @@ async function agentWithSession(
   if (agents === undefined) {
     ctx.emit('agent/created', { agent, source: 'startup' })
   } else {
-    agents.enter(agent, owner)
+    agents.enter(agent)
     await agents.announce(agent, 'startup')
   }
   return agent
@@ -91,24 +92,30 @@ async function agentWithSession(
 
 async function setup(config: StageConfig = STAGE_CONFIG): Promise<Context> {
   const ctx = new Context()
-  // The projection registry is a required injection of the service (the
-  // stage unit registers in the constructor); mount it first.
+  // The projection registry is a required injection; asynchronous service
+  // initialization retains the ready reader before publishing consumers.
   await ctx.plugin(SessionProjection)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(NativeExecutor)
   await ctx.plugin(StageController, config)
   return ctx
 }
 
 let callCounter = 0
-function callStage(ctx: Context, name: string, agent: Agent | undefined, args: Record<string, unknown>) {
-  return ctx.tools.execute({
-    callId: ToolCallId(`call-${++callCounter}`),
-    name,
-    arguments: args,
+async function callStage(ctx: Context, name: string, agent: Agent | undefined, args: Record<string, unknown>) {
+  const callId = ToolCallId(`call-${++callCounter}`)
+  const batch = await ctx.tools.execute({
+    calls: [{ type: 'tool-call', id: callId, name, arguments: JSON.stringify(args) }],
     signal: new AbortController().signal,
     ...agent ? { agent } : {},
   })
+  expect(batch.results).toHaveLength(1)
+  expect(batch.results[0]?.callId).toBe(callId)
+  expect(batch.additionalContexts).toEqual([])
+  const entry = batch.results[0]
+  if (entry === undefined) throw new Error('expected one stage tool result')
+  return entry.result
 }
 
 function setupWithReview(config: StageConfig = STAGE_CONFIG, answer?: { selected: string[]; custom?: string }) {
@@ -333,7 +340,7 @@ describe('stage prompt messages', () => {
     const signal = new AbortController().signal
     const decision = await events.waterfall(
       'agent/pre-step',
-      { messages: [message], turn: 1, step: 1, signal },
+      { messages: [message], turn: 1, step: 1, signal, modelSelection: { provider: 'test', model: 'test-model' } },
       () => Promise.resolve({ kind: 'reject' as const }),
     )
     expect(decision.kind).toBe('reject')
@@ -996,6 +1003,7 @@ describe('goto_stage full transition', () => {
     await ctx.plugin(SessionProjection)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeExecutor)
     const fiber = await ctx.plugin(StageController, STAGE_CONFIG)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
@@ -1307,6 +1315,7 @@ describe('HMR disposal', () => {
     await ctx.plugin(SessionProjection)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeExecutor)
     const fiber = await ctx.plugin(StageController, STAGE_CONFIG)
     const agent = await agentWithSession(ctx, 'disposed-recovery')
     const before = await assembleFor(ctx, agent)

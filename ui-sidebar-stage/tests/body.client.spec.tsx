@@ -325,11 +325,17 @@ describe('StageBody', () => {
     expect(container.querySelector<HTMLButtonElement>('[data-stage-switch]')?.disabled).toBe(false)
   })
 
-  it('opens with Ctrl/Cmd+K and closes on Escape', async () => {
+  it('opens with Ctrl/Cmd+Shift+K and closes on Escape', async () => {
     const { container } = bodyOf({ wire: wireView() })
     const root = container.querySelector('[data-stage-tab]')!
     await act(async () => {
       fireEvent.keyDown(root, { key: 'k', ctrlKey: true })
+    })
+    // Ctrl/Cmd+K belongs to the desktop session-search command; it must not
+    // open the stage palette.
+    expect(container.querySelector('[data-stage-menu]')).toBeNull()
+    await act(async () => {
+      fireEvent.keyDown(root, { key: 'k', ctrlKey: true, shiftKey: true })
     })
     expect(container.querySelector('[data-stage-menu]')).not.toBeNull()
     await act(async () => {

@@ -38,7 +38,7 @@ import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed, MessageSource } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionSeq, UserMessage } from '@deepseek-ai/dsh-session'
-import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
+import type { ProjectionDefinition, ProjectionHandle } from '@deepseek-ai/dsh-session-projection'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
@@ -79,10 +79,6 @@ declare module '@deepseek-ai/dsh-llm' {
  * own fold fallback for sessions whose composition never mounted this plugin.
  */
 declare module '@deepseek-ai/dsh-session-projection/types' {
-  interface SessionProjectionStateMap {
-    stage: StageProjectionState
-  }
-
   interface SessionProjectionMap {
     stage: StageWireView
   }
@@ -586,7 +582,9 @@ function surfaceHeadAfter(
 function stageProjectionDefinition(
   stages: readonly StageDefinition[],
   initial: string,
-): ProjectionDefinition<'stage'> & { wire: NonNullable<ProjectionDefinition<'stage'>['wire']> } {
+): ProjectionDefinition<'stage', StageProjectionState> & {
+  wire: NonNullable<ProjectionDefinition<'stage', StageProjectionState>['wire']>
+} {
   const catalog = stages.map(({ name, alias, instruction }) =>
     alias === undefined ? { name, instruction } : { name, alias, instruction })
   let lastView: StageWireView | undefined
@@ -810,6 +808,9 @@ export class StageController extends Service {
   private readonly eligibility = new Set<(agent: Agent) => boolean>()
   /** Reviewed transitions awaiting the next accepted in-turn pre-step. */
   private readonly pendingTransitions = new WeakMap<Session, PendingTransition>()
+  /** The ready reader is retained only while this service is alive. */
+  private projectionHandle: ProjectionHandle<StageProjectionState> | undefined
+  private disposed = false
 
   constructor(ctx: Context, config: StageConfig) {
     super(ctx, 'stage')
@@ -827,15 +828,24 @@ export class StageController extends Service {
     this.handoffDir = resolved.handoffDir ?? 'handoff'
     this.minHandoffTokens = resolved.minHandoffTokens
     this.prompts = resolveStageSwitchPrompts(resolved.language ?? 'en')
-    // The read state: one projection unit the framework drives eagerly over
-    // committed events (see {@link StageProjectionState}). Its wire view is
-    // the client-visible catalog/history/counters the sidebar reads; the
-    // factory closes over this instance's catalog and initial stage.
-    // Registration is effect-scoped on this service's fiber, so an HMR
-    // disposal removes the key; {@link projectionOf} makes an absent key a
-    // loud failure, never a silent default.
-    ctx.sessionProjections.register(stageProjectionDefinition(this.stages, this.initial))
-    let disposed = false
+    // A retained projection handle stays readable after unregistration. The
+    // service intentionally does not: close even an in-flight initialization
+    // so leaked references cannot read or mutate stage state after teardown.
+    ctx.effect(() => () => {
+      this.disposed = true
+      this.projectionHandle = undefined
+    }, 'dsh-stage-switch: close service lifetime')
+  }
+
+  protected async [Service.init](): Promise<void> {
+    const ctx = this.ctx
+    // The definition installs on this fiber; registration failures reject
+    // activation. Publish no callbacks until the retained reader is ready.
+    const handle = await ctx.sessionProjections.register(stageProjectionDefinition(this.stages, this.initial))
+    if (this.disposed) {
+      throw new Error('dsh-stage-switch: the stage service is disposed')
+    }
+    this.projectionHandle = handle
     // Pre-step is outside Session.append publication, so it can append the
     // stage prompt message inside an open turn without re-entering the
     // session. A failed append remains pending for a later accepted in-turn
@@ -875,7 +885,6 @@ export class StageController extends Service {
       }
       return decision
     })
-    ctx.effect(() => () => { disposed = true }, 'dsh-stage-switch: close service lifetime')
 
     // The switch guidance contributes to the runtime-context snapshot only
     // while a deployment predicate is true. As a context rather than a prompt
@@ -1020,7 +1029,7 @@ export class StageController extends Service {
         })
         // A review may outlive this plugin fiber. Without its pre-step listener,
         // an approved transition could never be applied, so fail and stay put.
-        if (disposed) {
+        if (this.disposed) {
           throw new Error('the stage-switch service was reloaded while the transition was under review; present the transition again')
         }
         const reviewItems = answer.answers.filter(entry => entry.id === REVIEW_ID)
@@ -1105,18 +1114,20 @@ export class StageController extends Service {
     return [...this.instructionByStage.keys()].sort().join(', ')
   }
 
-  /**
-   * The session's `stage` projection state. The unit is registered for the
-   * service's whole lifetime, so an absent key means the registry lost the
-   * registration (a reload race): the projection seam's mandatory-reader
-   * rule — fail loud, never degrade to a default.
-   */
-  private projectionOf(session: Session): StageProjectionState {
-    const state = this.ctx.sessionProjections.stateOf(session, 'stage')
-    if (state === undefined) {
-      throw new Error('dsh-stage-switch: the stage projection unit is not registered')
+  /** Fail loud outside the service's ready lifetime, even for retained references. */
+  private readyHandle(): ProjectionHandle<StageProjectionState> {
+    if (this.disposed) {
+      throw new Error('dsh-stage-switch: the stage service is disposed')
     }
-    return state
+    if (this.projectionHandle === undefined) {
+      throw new Error('dsh-stage-switch: the stage projection is not initialized')
+    }
+    return this.projectionHandle
+  }
+
+  /** Read through the ready, fiber-owned handle, never the deprecated registry reader. */
+  private projectionOf(session: Session): StageProjectionState {
+    return this.readyHandle().stateOf(session)
   }
 
   /**
@@ -1131,6 +1142,7 @@ export class StageController extends Service {
    * @returns the effect disposer that unregisters the predicate.
    */
   registerEligibility(predicate: (agent: Agent) => boolean): () => void {
+    this.readyHandle()
     if (typeof predicate !== 'function') {
       throw new TypeError('stage eligibility predicate must be a function')
     }

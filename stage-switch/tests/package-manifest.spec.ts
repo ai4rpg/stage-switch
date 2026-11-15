@@ -12,8 +12,11 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 interface Manifest {
-  readonly engines?: { readonly dsh?: string }
+  readonly version?: string
+  readonly engines?: { readonly dsh?: string; readonly node?: string }
   readonly peerDependencies?: Readonly<Record<string, string>>
+  readonly devDependencies?: Readonly<Record<string, string>>
+  readonly dependencies?: Readonly<Record<string, string>>
 }
 
 const manifest = JSON.parse(
@@ -21,8 +24,10 @@ const manifest = JSON.parse(
 ) as Manifest
 
 describe('package manifest', () => {
-  it('declares the dsh 0.2 compatibility range', () => {
-    expect(manifest.engines?.dsh).toBe('>=0.2.0-rc.2 <0.3.0-0')
+  it('declares the rc.3 handle baseline and its Node floor', () => {
+    expect(manifest.version).toBe('0.2.2')
+    expect(manifest.engines?.dsh).toBe('>=0.2.2-rc.3 <0.3.0-0')
+    expect(manifest.engines?.node).toBe('>=24.9.0')
   })
 
   it('keeps the runtime dsh peers for the loader resolution map', () => {
@@ -34,12 +39,24 @@ describe('package manifest', () => {
     ]))
   })
 
-  it('accepts both dsh 0.2 lines in the runtime peers', () => {
+  it('pins the schema dependency to rc.3 for ProjectionDefinition type identity', () => {
+    expect(manifest.dependencies?.zod).toBe('4.6.6')
+  })
+
+  it('tests against rc.3 DSH packages including the native executor', () => {
+    const devDependencies = Object.entries(manifest.devDependencies ?? {})
+      .filter(([name]) => name.startsWith('@deepseek-ai/dsh-'))
+    expect(devDependencies.length).toBeGreaterThan(0)
+    expect(manifest.devDependencies?.['@deepseek-ai/dsh-tool-executor-native']).toBe('^0.2.2-rc.3')
+    for (const [name, range] of devDependencies) expect(range, name).toBe('^0.2.2-rc.3')
+  })
+
+  it('requires the rc.3 API in the runtime peers', () => {
     const dshPeers = Object.entries(manifest.peerDependencies ?? {})
       .filter(([name]) => name.startsWith('@deepseek-ai/dsh-'))
     expect(dshPeers.length).toBeGreaterThan(0)
     for (const [name, range] of dshPeers) {
-      expect(range, name).toBe('^0.2.0-rc.2 || ^0.2.1-rc.2')
+      expect(range, name).toBe('^0.2.2-rc.3')
     }
   })
 })
